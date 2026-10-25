@@ -63,14 +63,34 @@ from telethon.tl import types
 async def pm_delete_raw_update(e):
     try:
         u = e.update
-        if isinstance(u, types.UpdateDeleteMessages) and u.peer:
-            uid = getattr(u.peer, 'user_id', None)
-            cid = int(uid) if uid is not None else None
+        u_type = type(u).__name__
+        
+        # Логируем все события, связанные с удалением, чтобы увидеть их в консоли
+        if 'Delete' in u_type:
+            logger.info(f"[PM-DEL-RAW] Получен апдейт удаления: {u_type} -> {u}")
+
+        if isinstance(u, types.UpdateDeleteMessages):
             msg_ids = list(u.messages or [])
-            logger.info(f"[PM-DEL-RAW] UpdateDeleteMessages chat={cid} count={len(msg_ids)}")
+            logger.info(f"[PM-DEL-RAW] UpdateDeleteMessages: ID сообщений {msg_ids}")
             await ensure_pm_delete_worker()
+            
             for msg_id in msg_ids:
-                old = db.get_pm_cached(cid, msg_id)
+                # Так как у UpdateDeleteMessages нет peer, ищем чат по нашему локальному кэшу сообщений
+                cid = None
+                if hasattr(db, 'find_chat_by_msg_id'):
+                    cid = db.find_chat_by_msg_id(msg_id)
+                
+                old = db.get_pm_cached(cid, msg_id) if cid else None
+                
+                # Если сходу не нашли чат, попытаемся пройти по всем последним чатам из кэша (если база поддерживает)
+                if not old and hasattr(db, 'get_all_pm_cache_keys'):
+                    for test_cid in db.get_all_pm_cache_keys():
+                        maybe_old = db.get_pm_cached(test_cid, msg_id)
+                        if maybe_old:
+                            cid = test_cid
+                            old = maybe_old
+                            break
+
                 username = None
                 if old and old.get('sender_id'):
                     try:
@@ -78,6 +98,7 @@ async def pm_delete_raw_update(e):
                         username = getattr(s, 'username', None)
                     except Exception:
                         pass
+
                 logger.info(f"[PM-DEL-RAW] Клад: chat={cid} msg={msg_id} has_old={bool(old)}")
                 await _pm_delete_queue.put({
                     'chat_id': cid,
@@ -87,7 +108,7 @@ async def pm_delete_raw_update(e):
                 })
                 await asyncio.sleep(0.01)
     except Exception as ex:
-        logger.debug(f"[PM-DEL-RAW] err: {ex}")
+        logger.debug(f"[PM-DEL-RAW] err: {ex}", exc_info=True)
         pass
 
 
