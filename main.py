@@ -2165,7 +2165,8 @@ async def pm_edited_handler(e):
 @client.on(events.MessageDeleted())
 async def pm_deleted_handler(e):
     try:
-        for msg_id in e.deleted_ids:
+        ids = list(e.deleted_ids or [])
+        for msg_id in ids:
             chat = e.chat_id
             if chat is None:
                 continue
@@ -2187,6 +2188,7 @@ async def pm_deleted_handler(e):
             else:
                 await notify.pm_deleted(chat, 0, 'неизвестный', '', False, None, username=None)
             db.delete_pm_cached(chat, msg_id)
+            await asyncio.sleep(0.3)
     except Exception as ex:
         logger.debug(f"pm_deleted_handler err: {ex}")
 
