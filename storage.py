@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 _VALID_TABLES = frozenset({
     'bot_state', 'saved_data', 'notes', 'todos', 'stats',
     'reply_settings', 'sessions', 'protected_chats',
+    'online_watch', 'pm_msg_cache',
 })
 
 
@@ -49,6 +50,28 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS reply_settings (key TEXT PRIMARY KEY, value TEXT);
                 CREATE TABLE IF NOT EXISTS sessions (hash TEXT PRIMARY KEY, value TEXT);
                 CREATE TABLE IF NOT EXISTS protected_chats (chat_id TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE IF NOT EXISTS online_watch (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_id INTEGER NOT NULL UNIQUE,
+                    target_username TEXT,
+                    message TEXT NOT NULL,
+                    owner_id INTEGER NOT NULL,
+                    chat_id INTEGER,
+                    last_status TEXT DEFAULT 'unknown',
+                    enabled INTEGER DEFAULT 1,
+                    created_at INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS pm_msg_cache (
+                    chat_id INTEGER,
+                    msg_id INTEGER,
+                    sender_id INTEGER,
+                    sender_name TEXT,
+                    text TEXT,
+                    has_media INTEGER DEFAULT 0,
+                    media_type TEXT,
+                    date INTEGER,
+                    PRIMARY KEY(chat_id, msg_id)
+                );
             ''')
             self.conn.commit()
 
@@ -232,3 +255,71 @@ class Storage:
 
     def clear_protected_chats(self):
         self._delete_all('protected_chats')
+
+    # ── Online watch ──
+
+    def add_online_watch(self, target_id, target_username, message, owner_id, chat_id):
+        with self.lock:
+            self.conn.execute(
+                'INSERT OR REPLACE INTO online_watch (target_id, target_username, message, owner_id, chat_id, last_status, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)',
+                (int(target_id), target_username or '', message, int(owner_id), int(chat_id), 'unknown', int(time.time()))
+            )
+            self.conn.commit()
+
+    def get_online_watches(self):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute('SELECT * FROM online_watch WHERE enabled = 1')
+            return [dict(row) for row in cur.fetchall()]
+
+    def update_online_watch_status(self, watch_id, last_status):
+        with self.lock:
+            self.conn.execute('UPDATE online_watch SET last_status = ? WHERE id = ?', (last_status, watch_id))
+            self.conn.commit()
+
+    def remove_online_watch(self, target_id=None, watch_id=None):
+        with self.lock:
+            if watch_id is not None:
+                self.conn.execute('DELETE FROM online_watch WHERE id = ?', (watch_id,))
+            elif target_id is not None:
+                self.conn.execute('DELETE FROM online_watch WHERE target_id = ?', (int(target_id),))
+            self.conn.commit()
+
+    def get_online_watch_by_target(self, target_id):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute('SELECT * FROM online_watch WHERE target_id = ?', (int(target_id),))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    # ── PM message cache ──
+
+    def cache_pm_message(self, chat_id, msg_id, sender_id, sender_name, text, has_media, media_type):
+        with self.lock:
+            self.conn.execute(
+                'INSERT OR REPLACE INTO pm_msg_cache (chat_id, msg_id, sender_id, sender_name, text, has_media, media_type, date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                (int(chat_id), int(msg_id), int(sender_id) if sender_id else 0, sender_name or '', text or '', 1 if has_media else 0, media_type or '', int(time.time()))
+            )
+            self.conn.commit()
+
+    def get_pm_cached(self, chat_id, msg_id):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute('SELECT * FROM pm_msg_cache WHERE chat_id = ? AND msg_id = ?', (int(chat_id), int(msg_id)))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def delete_pm_cached(self, chat_id, msg_id):
+        with self.lock:
+            self.conn.execute('DELETE FROM pm_msg_cache WHERE chat_id = ? AND msg_id = ?', (int(chat_id), int(msg_id)))
+            self.conn.commit()
+
+    def clean_pm_cache(self, limit=4000):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute('SELECT COUNT(*) as c FROM pm_msg_cache')
+            row = cur.fetchone()
+            cnt = row['c'] if row else 0
+            if cnt > limit:
+                cur.execute('DELETE FROM pm_msg_cache WHERE rowid IN (SELECT rowid FROM pm_msg_cache ORDER BY date ASC LIMIT ?)', (cnt - limit,))
+                self.conn.commit()

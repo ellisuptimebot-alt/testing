@@ -25,6 +25,7 @@ from telethon.tl.functions.messages import SendReactionRequest
 from telethon.tl.types import (
     ChannelParticipantsAdmins, ChannelParticipantsBots, InputMediaDice,
     ReactionEmoji,
+    UserStatusOnline, UserStatusOffline, UserStatusRecently, UserStatusLastWeek, UserStatusLastMonth,
 )
 
 import qrcode
@@ -34,6 +35,7 @@ from config import (
     MEDIA_DIR, MAX_COOLDOWN_ENTRIES,
     MAX_FILE_SIZE_MB, logger,
 )
+from notifier import notify
 from utils import fmt_time, progress_bar, safe_eval, caesar, morse_enc, gen_pwd, vigenere
 from downloaders import run_download, send_and_clean, set_max_file_size
 from rp_commands import (
@@ -1761,11 +1763,21 @@ async def watch_cmd(e):
                         h = hashlib.md5(f"{auth.hash}{auth.device_model}{auth.platform}".encode()).hexdigest()
                         if h not in known:
                             db.save_session(h, json.dumps({"device": auth.device_model, "platform": auth.platform, "ip": auth.ip, "date": str(auth.date_created)}))
-                            me = await client.get_me()
-                            await client.send_message(me.id, f"⚠️ **Новый вход**\nУстройство: {auth.device_model}\nПлатформа: {auth.platform}\nIP: {auth.ip}\nДата: {auth.date_created}")
+                            try:
+                                await notify.session_alert(auth.device_model, auth.platform, auth.ip, str(auth.date_created))
+                            except Exception:
+                                try:
+                                    me = await client.get_me()
+                                    await client.send_message(me.id, f"⚠️ **Новый вход**\nУстройство: {auth.device_model}\nПлатформа: {auth.platform}\nIP: {auth.ip}\nДата: {auth.date_created}")
+                                except Exception:
+                                    pass
                             logger.warning(f"New session: {auth.device_model} {auth.ip}")
                 except Exception as ex:
                     logger.error(f"Watch error: {ex}")
+                    try:
+                        await notify.error_alert("Watch monitor", str(ex))
+                    except Exception:
+                        pass
                 await asyncio.sleep(300)
 
         _watch_task = asyncio.create_task(monitor())
@@ -1839,11 +1851,21 @@ async def protect_cmd(e):
                     protected = set(db.get_protected_chat_ids())
                     missing = protected - current
                     for cid in missing:
-                        me = await client.get_me()
-                        await client.send_message(me.id, f"⚠️ **Удалён чат**\nID: `{cid}`\nЧат был удалён или вы из него вышли.")
+                        try:
+                            await notify.protect_alert(cid)
+                        except Exception:
+                            try:
+                                me = await client.get_me()
+                                await client.send_message(me.id, f"⚠️ **Удалён чат**\nID: `{cid}`\nЧат был удалён или вы из него вышли.")
+                            except Exception:
+                                pass
                         db.del_protected_chat(cid)
                 except Exception as ex:
                     logger.error(f"Protect monitor error: {ex}")
+                    try:
+                        await notify.error_alert("Protect monitor", str(ex))
+                    except Exception:
+                        pass
                 await asyncio.sleep(120)
 
         _protect_task = asyncio.create_task(monitor())
@@ -1986,10 +2008,20 @@ async def safe_flood(coro_factory, max_retries=3):
             return await coro_factory()
         except FloodWaitError as e:
             logger.warning(f"FloodWait: {e.seconds}s, попытка {attempt + 1}/{max_retries}")
+            try:
+                await notify.error_alert("FloodWait", f"{e.seconds} секунд")
+            except Exception:
+                pass
             if attempt < max_retries - 1:
                 await asyncio.sleep(e.seconds + 1)
             else:
                 raise
+        except Exception as ex:
+            try:
+                await notify.error_alert("Ошибка отправки", str(ex))
+            except Exception:
+                pass
+            raise
 
 
 async def shadow_delete_msg(msg, delay=None):
@@ -1999,6 +2031,187 @@ async def shadow_delete_msg(msg, delay=None):
         await msg.delete()
     except Exception:
         pass
+
+
+# ── PM cache + edit/delete notify ──
+
+@client.on(events.NewMessage(incoming=True))
+async def pm_cache_incoming(e):
+    if not e.is_private:
+        return
+    try:
+        msg = e.message
+        text = msg.text or msg.message or ''
+        has_media = bool(msg.media)
+        media_type = None
+        if getattr(msg, 'photo', None):
+            media_type = 'photo'
+        elif getattr(msg, 'video', None):
+            media_type = 'video'
+        elif getattr(msg, 'document', None):
+            media_type = 'document'
+        elif getattr(msg, 'voice', None):
+            media_type = 'voice'
+        elif getattr(msg, 'audio', None):
+            media_type = 'audio'
+        elif getattr(msg, 'sticker', None):
+            media_type = 'sticker'
+        elif getattr(msg, 'gif', None):
+            media_type = 'gif'
+        sender = await e.get_sender()
+        sender_name = f"{getattr(sender, 'first_name', '') or ''} {getattr(sender, 'last_name', '') or ''}".strip() or str(e.sender_id)
+        db.cache_pm_message(e.chat_id, e.id, e.sender_id, sender_name, text, has_media, media_type)
+        db.clean_pm_cache()
+    except Exception as ex:
+        logger.debug(f"pm_cache_incoming err: {ex}")
+
+
+@client.on(events.MessageEdited())
+async def pm_edited_handler(e):
+    if not e.is_private:
+        return
+    try:
+        old = db.get_pm_cached(e.chat_id, e.id)
+        new_text = e.message.text or e.message.message or ''
+        if old and (old['text'] or '') == (new_text or ''):
+            return
+        sender_name = old['sender_name'] if old else str(e.sender_id)
+        sender_id = old['sender_id'] if old else e.sender_id
+        await notify.pm_edited(e.chat_id, sender_id, sender_name, old['text'] if old else '', new_text)
+        if old:
+            db.cache_pm_message(e.chat_id, e.id, sender_id, sender_name, new_text, bool(old['has_media']), old['media_type'])
+    except Exception as ex:
+        logger.debug(f"pm_edited_handler err: {ex}")
+
+
+@client.on(events.MessageDeleted())
+async def pm_deleted_handler(e):
+    try:
+        for msg_id in e.deleted_ids:
+            chat = e.chat_id
+            if chat is None:
+                continue
+            try:
+                ent = await e.get_chat()
+                if not getattr(ent, 'is_user', False):
+                    continue
+            except Exception:
+                continue
+            old = db.get_pm_cached(chat, msg_id)
+            if not old:
+                await notify.pm_deleted(chat, 0, 'неизвестный', '', False, None)
+            else:
+                await notify.pm_deleted(chat, old['sender_id'], old['sender_name'], old['text'], bool(old['has_media']), old['media_type'])
+            db.delete_pm_cached(chat, msg_id)
+    except Exception as ex:
+        logger.debug(f"pm_deleted_handler err: {ex}")
+
+
+# ── Online watch ──
+
+@client.on(events.NewMessage(pattern=r'^!onwatch(?:\s+(@\w+))?\s+(.+)$', func=owner_filter))
+async def onwatch_cmd(e):
+    g = e.pattern_match
+    target_raw = g.group(1)
+    msg_text = g.group(2).strip()
+    if not target_raw:
+        await respond(e, "ℹ️ Использование: `!onwatch @username текст сообщения`")
+        return
+    username = target_raw.lstrip('@')
+    try:
+        ent = await client.get_entity(username)
+    except Exception as ex:
+        await respond(e, f"❌ Не удалось найти пользователя: {ex}")
+        return
+    if getattr(ent, 'bot', False):
+        await respond(e, "❌ Нельзя следить за ботом.")
+        return
+    db.add_online_watch(ent.id, getattr(ent, 'username', username) or username, msg_text, OWNER_ID, e.chat_id)
+    await respond(e, f"✅ Буду караулить <b>@{getattr(ent,'username',username)}</b>\nКак только он появится в сети (после оффлайна) — отправлю ему сообщение и уведомлю в боте.\n\nТрек работает раз за разом.")
+
+
+@client.on(events.NewMessage(pattern=r'^!onwatchlist$', func=owner_filter))
+async def onwatchlist_cmd(e):
+    rows = db.get_online_watches()
+    if not rows:
+        await respond(e, "📭 Список отслеживаемых пуст.")
+        return
+    lines = ["📡 <b>ONWATCH</b>\n"]
+    for r in rows:
+        lines.append(f"• <b>@{r['target_username'] or r['target_id']}</b> [<code>{r['target_id']}</code>] | last: <code>{r['last_status']}</code>\n  <i>{r['message'][:40]}{'...' if len(r['message'])>40 else ''}</i>")
+    await respond(e, "\n".join(lines))
+
+
+@client.on(events.NewMessage(pattern=r'^!unonwatch(?:\s+(@\w+))?$', func=owner_filter))
+async def unonwatch_cmd(e):
+    target_raw = e.pattern_match.group(1)
+    if not target_raw:
+        await respond(e, "ℹ️ Использование: `!unonwatch @username`")
+        return
+    username = target_raw.lstrip('@')
+    try:
+        ent = await client.get_entity(username)
+    except Exception as ex:
+        await respond(e, f"❌ Не найден: {ex}")
+        return
+    db.remove_online_watch(target_id=ent.id)
+    await respond(e, f"🗑 Отслеживание <b>@{username}</b> снято.")
+
+
+async def online_watcher():
+    while True:
+        try:
+            watches = db.get_online_watches()
+            if not watches:
+                await asyncio.sleep(40)
+                continue
+            for w in watches:
+                try:
+                    ent = await client.get_entity(w['target_id'])
+                    status = ent.status
+                    cur = 'unknown'
+                    if isinstance(status, UserStatusOnline):
+                        cur = 'online'
+                    elif isinstance(status, UserStatusOffline):
+                        cur = 'offline'
+                    elif isinstance(status, UserStatusRecently):
+                        cur = 'recently'
+                    elif isinstance(status, UserStatusLastWeek):
+                        cur = 'last_week'
+                    elif isinstance(status, UserStatusLastMonth):
+                        cur = 'last_month'
+                    else:
+                        cur = 'unknown'
+                    prev = w['last_status'] or 'unknown'
+                    if prev != 'online' and cur == 'online':
+                        try:
+                            await client.send_message(w['target_id'], w['message'])
+                        except Exception as ex:
+                            logger.warning(f"[ONWATCH] Не удалось отправить сообщение {w['target_id']}: {ex}")
+                            try:
+                                await notify.error_alert("ONWATCH", f"Не удалось отправить сообщение @{w['target_username']} [{w['target_id']}]: {ex}")
+                            except Exception:
+                                pass
+                            db.update_online_watch_status(w['id'], cur)
+                            continue
+                        try:
+                            await notify.online_watch(w['target_username'] or str(w['target_id']), w['target_id'], w['message'])
+                        except Exception:
+                            pass
+                        db.update_online_watch_status(w['id'], cur)
+                        continue
+                    if prev == 'online' and cur != 'online':
+                        db.update_online_watch_status(w['id'], cur)
+                        continue
+                    if prev != cur:
+                        db.update_online_watch_status(w['id'], cur)
+                        continue
+                except Exception as ex:
+                    logger.debug(f"[ONWATCH] skip {w.get('target_id')}: {ex}")
+                    continue
+        except Exception as ex:
+            logger.warning(f"[ONWATCH] loop err: {ex}")
+        await asyncio.sleep(35)
 
 @client.on(events.NewMessage(outgoing=True, func=lambda e: e.is_private and e.reply_to_msg_id))
 async def rp_outgoing_handler(event):
@@ -2087,5 +2300,11 @@ if __name__ == "__main__":
         print("   Совет: останови второй экземпляр бота (локальный или на Render), иначе — снова блок.")
         print("   Для удельной смены окружения задай STRING_SESSION в .env.")
         client.start()
+    try:
+        client.loop.create_task(online_watcher())
+        logger.info("[TASK] online_watcher запущен")
+    except Exception as e:
+        logger.warning(f"[TASK] online_watcher не запущен: {e}")
+
     print("✅ Бот запущен!")
     client.run_until_disconnected()
