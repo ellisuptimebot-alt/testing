@@ -2109,10 +2109,38 @@ async def pm_edited_handler(e):
     if not e.is_private:
         return
     try:
-        old = db.get_pm_cached(e.chat_id, e.id)
         new_text = e.message.text or e.message.message or ''
+        old = db.get_pm_cached(e.chat_id, e.id)
+
+        if not new_text.strip():
+            if old and (old['text'] or '').strip():
+                username = None
+                try:
+                    s = await client.get_entity(old['sender_id'])
+                    username = getattr(s, 'username', None)
+                except Exception:
+                    pass
+                sender_name = old['sender_name'] or str(old['sender_id'] or e.sender_id)
+                await notify.pm_deleted(e.chat_id, old['sender_id'], sender_name, old['text'], bool(old['has_media']), old['media_type'], username=username)
+                db.delete_pm_cached(e.chat_id, e.id)
+                return
+            sender = None
+            try:
+                sender = await e.get_sender()
+            except Exception:
+                sender = None
+            username = getattr(sender, 'username', None) if sender else None
+            if sender:
+                sender_name = f"{getattr(sender, 'first_name', '') or ''} {getattr(sender, 'last_name', '') or ''}".strip()
+            else:
+                sender_name = username or str(e.sender_id)
+            await notify.pm_deleted(e.chat_id, e.sender_id, sender_name, '', False, None, username=username)
+            db.delete_pm_cached(e.chat_id, e.id)
+            return
+
         if old and (old['text'] or '') == (new_text or ''):
             return
+
         sender = None
         try:
             sender = await e.get_sender()
