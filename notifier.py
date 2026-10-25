@@ -49,6 +49,7 @@ class Notifier:
 
     async def send(self, text: str, preview: bool = False):
         if not self.enabled or not self.url or not self.chat_id:
+            logger.warning(f"[NOTIFY] Не отправлено - disabled/enabled={self.enabled} url={bool(self.url)} chat_id={self.chat_id}")
             return False
         try:
             payload = {
@@ -57,11 +58,14 @@ class Notifier:
                 "parse_mode": "HTML",
                 "disable_web_page_preview": not preview,
             }
+            logger.info(f"[NOTIFY] Отправка в {self.chat_id} (len={len(text)})")
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
                 async with session.post(self.url, json=payload) as resp:
+                    data = await resp.text()
                     if resp.status != 200:
-                        data = await resp.text()
-                        logger.debug(f"[NOTIFY] HTTP {resp.status}: {data[:150]}")
+                        logger.warning(f"[NOTIFY] HTTP {resp.status}: {data[:200]}")
+                    else:
+                        logger.info(f"[NOTIFY] Успешно отправлено")
                     return resp.status == 200
         except Exception as e:
             logger.warning(f"[NOTIFY] Ошибка отправки: {e}")
