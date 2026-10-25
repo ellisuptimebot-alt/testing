@@ -103,9 +103,12 @@ CMD_DESCS = {
     'top':          {'desc': 'Топ активных пользователей', 'syntax': '!top [n]', 'example': '!top 100'},
     'bots':         {'desc': 'Список ботов в чате', 'syntax': '!bots', 'example': '!bots'},
     'sudo':         {'desc': 'Управление sudo-пользователями', 'syntax': '!sudo [on|off] @user', 'example': '!sudo on @durov'},
-    'watch':        {'desc': 'Мониторинг новых сессий', 'syntax': '!watch [on|off]', 'example': '!watch on'},
+    'watch':        {'desc': 'Мониторинг новых сессий (уведомление в боте)', 'syntax': '!watch [on|off]', 'example': '!watch on'},
     'check_email':  {'desc': 'Проверить email на утечки', 'syntax': '!check_email <email>', 'example': '!check_email test@example.com'},
-    'protect':      {'desc': 'Защита от удаления чатов', 'syntax': '!protect [on|off]', 'example': '!protect on'},
+    'protect':      {'desc': 'Детектор пропавших чатов (уведомление в боте)', 'syntax': '!protect [on|off]', 'example': '!protect on'},
+    'onwatch':      {'desc': 'Караулить появление в сети', 'syntax': '!onwatch @user <текст>', 'example': '!onwatch @username Привет, глянь ЛС'},
+    'onwatchlist':  {'desc': 'Список активных onwatch-треков', 'syntax': '!onwatchlist', 'example': '!onwatchlist'},
+    'unonwatch':    {'desc': 'Снять отслеживание', 'syntax': '!unonwatch @user', 'example': '!unonwatch @username'},
     'rphelp':       {'desc': 'Список RP-команд', 'syntax': '!rphelp', 'example': '!rphelp'},
     'trhelp':       {'desc': 'Список кодов языков для !translate', 'syntax': '!trhelp', 'example': '!trhelp'},
 }
@@ -144,6 +147,9 @@ COMMANDS_LIST = {
         '!note', '!getnote', '!delnote', '!notes',
         '!todo', '!todos', '!done', '!undone', '!deltodo'
     ],
+    'онлайн': [
+        '!onwatch', '!onwatchlist', '!unonwatch'
+    ],
     'безопасность': [
         '!sudo', '!watch', '!check_email', '!protect'
     ],
@@ -155,7 +161,7 @@ COMMANDS_LIST = {
 EMOJI_MAP = {
     'основные': '⚙️', 'стелс': '🛡️', 'профиль': '👤', 'игры': '🎮',
     'youtube': '🎬', 'утилиты': '🛠', 'сообщения': '✉️', 'заметки': '📦',
-    'безопасность': '🔐', 'afk': '😴', 'инфо': '📊', 'rp': '🎭',
+    'онлайн': '⚡', 'безопасность': '🔐', 'afk': '😴', 'инфо': '📊', 'rp': '🎭',
 }
 
 HELP_CATS = {
@@ -258,12 +264,19 @@ HELP_CATS = {
         "**Заметки:** `!note` `!getnote` `!delnote` `!notes`\n"
         "**TODO:** `!todo` `!todos` `!done` `!undone` `!deltodo`"
     ),
+    'онлайн': (
+        "⚡ **ОНЛАЙН-КАРАУЛ**\n\n"
+        "`!onwatch @user <текст>` — караулить появление в сети. Отправит сообщение таргету и уведомит в боте\n"
+        "`!onwatchlist` — список активных треков\n"
+        "`!unonwatch @user` — снять отслеживание\n\n"
+        "<i>Срабатывает по переходу оффлайн -> онлайн, работает раз за разом</i>"
+    ),
     'безопасность': (
         "🔐 **БЕЗОПАСНОСТЬ**\n\n"
         "`!sudo [on|off] @user` — управление sudo-доступом\n"
-        "`!watch [on|off]` — мониторинг новых сессий\n"
+        "`!watch [on|off]` — мониторинг новых сессий (уведомление в боте)\n"
         "`!check_email <email>` — проверка email на утечки\n"
-        "`!protect [on|off]` — защита от удаления чатов"
+        "`!protect [on|off]` — детектор пропавших чатов (уведомление в боте)"
     ),
     'afk': (
         "😴 **AFK**\n\n"
