@@ -57,8 +57,9 @@ _protect_task = None
 _pm_delete_queue = asyncio.Queue()
 _pm_delete_worker_started = False
 
+from telethon.tl import types
 
-@client.on(events.RawUpdate())
+@client.on(events.Raw)
 async def pm_delete_raw_update(e):
     try:
         u = e.update
