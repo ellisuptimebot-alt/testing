@@ -180,12 +180,27 @@ def owner_filter(event):
 
 async def respond(event, text, **kwargs):
     from telethon.errors import MessageNotModifiedError
+
+    if 'parse_mode' not in kwargs:
+        kwargs['parse_mode'] = 'md'
+
     if event.sender_id == OWNER_ID:
         try:
             return await event.edit(text, **kwargs)
         except MessageNotModifiedError:
             return None
-    return await event.reply(text, **kwargs)
+        except Exception:
+            try:
+                return await event.reply(text, **kwargs)
+            except Exception:
+                pass
+    try:
+        return await event.reply(text, **kwargs)
+    except Exception:
+        try:
+            return await event.reply(str(text))
+        except Exception:
+            return None
 
 
 _translator = {}

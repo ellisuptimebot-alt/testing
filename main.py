@@ -2116,70 +2116,87 @@ async def pm_deleted_handler(e):
 
 # ── Online watch ──
 
-@client.on(events.NewMessage(pattern=r'^!onwatch\b', func=owner_filter))
-async def onwatch_cmd(e):
-    text = e.raw_text or ''
-    m = re.match(r'^!onwatch\s+(@[\w\d_]+)\s+(.+)$', text, re.IGNORECASE | re.DOTALL)
-    if not m:
-        await respond(e, "ℹ️ Использование: `!onwatch @username текст сообщения`")
-        db.bump_stat('cmds')
-        return
-    target_raw = m.group(1)
-    msg_text = m.group(2).strip()
-    username = target_raw.lstrip('@')
+@client.on(events.NewMessage(func=owner_filter))
+async def onwatch_unified(e):
     try:
-        ent = await client.get_entity(username)
+        text = (e.raw_text or '').strip()
+        if not text:
+            return
+        low = text.lower()
+        if not low.startswith('!onwatch'):
+            return
+
+        if low == '!onwatchlist' or low.startswith('!onwatchlist '):
+            rows = db.get_online_watches()
+            if not rows:
+                await respond(e, "📭 Список отслеживаемых пуст.")
+                db.bump_stat('cmds')
+                return
+            lines = ["📡 **ONWATCH**\n"]
+            for r in rows:
+                uname = r['target_username'] or str(r['target_id'])
+                lines.append(f"• **@{uname}** [`{r['target_id']}`] | last: `{r['last_status']}`\n  _{r['message'][:40]}{'...' if len(r['message'])>40 else ''}_")
+            await respond(e, "\n".join(lines))
+            db.bump_stat('cmds')
+            return
+
+        if low.startswith('!unonwatch'):
+            m = re.match(r'^!unonwatch\s+(@[\w\d_]+)$', text, re.IGNORECASE)
+            if not m:
+                await respond(e, "ℹ️ Использование: `!unonwatch @username`")
+                db.bump_stat('cmds')
+                return
+            target_raw = m.group(1)
+            username = target_raw.lstrip('@')
+            try:
+                ent = await client.get_entity(username)
+            except Exception as ex:
+                await respond(e, f"❌ Не найден: {ex}")
+                db.bump_stat('cmds')
+                return
+            db.remove_online_watch(target_id=ent.id)
+            await respond(e, f"🗑 Отслеживание **@{username}** снято.")
+            db.bump_stat('cmds')
+            return
+
+        if low.startswith('!onwatch '):
+            m = re.match(r'^!onwatch\s+(@[\w\d_]+)\s+(.+)$', text, re.IGNORECASE | re.DOTALL)
+            if not m:
+                await respond(e, "ℹ️ Использование: `!onwatch @username текст сообщения`")
+                db.bump_stat('cmds')
+                return
+            target_raw = m.group(1)
+            msg_text = m.group(2).strip()
+            username = target_raw.lstrip('@')
+            try:
+                ent = await client.get_entity(username)
+            except Exception as ex:
+                await respond(e, f"❌ Не удалось найти пользователя: {ex}")
+                db.bump_stat('cmds')
+                return
+            if getattr(ent, 'bot', False):
+                await respond(e, "❌ Нельзя следить за ботом.")
+                db.bump_stat('cmds')
+                return
+            try:
+                db.add_online_watch(ent.id, getattr(ent, 'username', username) or username, msg_text, OWNER_ID, e.chat_id)
+            except Exception as ex:
+                await respond(e, f"❌ Ошибка БД: {ex}")
+                db.bump_stat('cmds')
+                return
+            await respond(e, f"✅ Буду караулить **@{getattr(ent,'username',username)}**\nКак только он появится в сети (после оффлайна) — отправлю ему сообщение и уведомлю в боте.\n\nТрек работает раз за разом.")
+            db.bump_stat('cmds')
+            return
+
+        await respond(e, "ℹ️ Использование: `!onwatch @username текст сообщения` | `!onwatchlist` | `!unonwatch @username`")
+        db.bump_stat('cmds')
+        return
     except Exception as ex:
-        await respond(e, f"❌ Не удалось найти пользователя: {ex}")
-        db.bump_stat('cmds')
-        return
-    if getattr(ent, 'bot', False):
-        await respond(e, "❌ Нельзя следить за ботом.")
-        db.bump_stat('cmds')
-        return
-    try:
-        db.add_online_watch(ent.id, getattr(ent, 'username', username) or username, msg_text, OWNER_ID, e.chat_id)
-    except Exception as ex:
-        await respond(e, f"❌ Ошибка БД: {ex}")
-        db.bump_stat('cmds')
-        return
-    await respond(e, f"✅ Буду караулить <b>@{getattr(ent,'username',username)}</b>\nКак только он появится в сети (после оффлайна) — отправлю ему сообщение и уведомлю в боте.\n\nТрек работает раз за разом.")
-    db.bump_stat('cmds')
-
-
-@client.on(events.NewMessage(pattern=r'^!onwatchlist\b', func=owner_filter))
-async def onwatchlist_cmd(e):
-    rows = db.get_online_watches()
-    if not rows:
-        await respond(e, "📭 Список отслеживаемых пуст.")
-        db.bump_stat('cmds')
-        return
-    lines = ["📡 <b>ONWATCH</b>\n"]
-    for r in rows:
-        lines.append(f"• <b>@{r['target_username'] or r['target_id']}</b> [<code>{r['target_id']}</code>] | last: <code>{r['last_status']}</code>\n  <i>{r['message'][:40]}{'...' if len(r['message'])>40 else ''}</i>")
-    await respond(e, "\n".join(lines))
-    db.bump_stat('cmds')
-
-
-@client.on(events.NewMessage(pattern=r'^!unonwatch\b', func=owner_filter))
-async def unonwatch_cmd(e):
-    text = e.raw_text or ''
-    m = re.match(r'^!unonwatch\s+(@[\w\d_]+)$', text, re.IGNORECASE)
-    if not m:
-        await respond(e, "ℹ️ Использование: `!unonwatch @username`")
-        db.bump_stat('cmds')
-        return
-    target_raw = m.group(1)
-    username = target_raw.lstrip('@')
-    try:
-        ent = await client.get_entity(username)
-    except Exception as ex:
-        await respond(e, f"❌ Не найден: {ex}")
-        db.bump_stat('cmds')
-        return
-    db.remove_online_watch(target_id=ent.id)
-    await respond(e, f"🗑 Отслеживание <b>@{username}</b> снято.")
-    db.bump_stat('cmds')
+        logger.error(f"onwatch_unified err: {ex}")
+        try:
+            await respond(e, f"❌ Ошибка: {ex}")
+        except Exception:
+            pass
 
 
 async def online_watcher():
