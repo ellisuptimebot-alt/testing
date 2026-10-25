@@ -109,14 +109,13 @@ async def _pm_delete_worker():
 
 
 async def ensure_pm_delete_worker():
-    global _pm_delete_worker_started
     if not _pm_delete_worker_started:
         try:
-            _pm_delete_worker_started = True
+            globals()['_pm_delete_worker_started'] = True
             asyncio.create_task(_pm_delete_worker())
             logger.info("[TASK] pm_delete_worker запущен (from handler)")
         except Exception as e:
-            _pm_delete_worker_started = False
+            globals()['_pm_delete_worker_started'] = False
             logger.debug(f"ensure_pm_delete_worker err: {e}")
 
 
@@ -2482,9 +2481,8 @@ if __name__ == "__main__":
         logger.warning(f"[TASK] online_watcher не запущен: {e}")
 
     try:
-        global _pm_delete_worker_started
         if not _pm_delete_worker_started:
-            _pm_delete_worker_started = True
+            globals()['_pm_delete_worker_started'] = True
             client.loop.create_task(_pm_delete_worker())
             logger.info("[TASK] pm_delete_worker запущен")
     except Exception as e:
