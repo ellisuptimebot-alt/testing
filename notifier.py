@@ -27,6 +27,26 @@ class Notifier:
             self.chat_id = None
             logger.warning("[NOTIFY] NOTIFY_BOT_TOKEN/NOTIFY_CHAT_ID не заданы. Уведомления через внешний бот отключены.")
 
+    def _format_user(self, uid, username=None, name=None):
+        try:
+            uid_int = int(uid) if uid else 0
+        except Exception:
+            uid_int = 0
+
+        uname = (username or '').strip().lstrip('@')
+        if uname:
+            if uid_int:
+                return f"@{uname} [<code>{uid_int}</code>]"
+            return f"@{uname}"
+
+        disp = (name or '').strip()
+        if not disp:
+            disp = 'пользователь'
+
+        if uid_int:
+            return f'<a href="tg://user?id={uid_int}">{disp}</a> [<code>{uid_int}</code>]'
+        return disp
+
     async def send(self, text: str, preview: bool = False):
         if not self.enabled or not self.url or not self.chat_id:
             return False
@@ -50,48 +70,54 @@ class Notifier:
     async def online_watch(self, username: str, target_id: int, sent_msg: str):
         if not NOTIFY_ONLINE_WATCH:
             return
+        user_str = self._format_user(target_id, username=username)
         msg = (
             f"⚡ <b>ONLINE WATCH</b>\n\n"
-            f"👤 Пользователь: <b>@{username or target_id}</b> [<code>{target_id}</code>]\n"
+            f"👤 Пользователь: {user_str}\n"
             f"🟢 Статус: <b>появился в сети</b>\n\n"
             f"✉️ <b>Сообщение отправлено таргету:</b>\n"
-            f"<i>{sent_msg}</i>"
+            f"<blockquote>{sent_msg}</blockquote>"
         )
         await self.send(msg)
 
-    async def pm_deleted(self, chat_id: int, sender_id: int, sender_name: str, text: str, has_media: bool, media_type: str):
+    async def pm_deleted(self, chat_id: int, sender_id: int, sender_name: str, text: str, has_media: bool, media_type: str, username: str = None):
         if not NOTIFY_PM_DELETE:
             return
-        body = text.strip() if text and text.strip() else "(пусто/только медиа)"
-        if len(body) > 900:
-            body = body[:900] + "..."
+        if text and text.strip():
+            body = text.strip()
+        else:
+            body = "Сообщение не найдено в кэше юзербота. Вероятно, оно было отправлено до запуска бота или уже не закэшировано."
+        user_str = self._format_user(sender_id, username=username, name=sender_name)
         media_info = ""
         if has_media:
             media_info = f"📎 Медиа: да ({media_type})\n" if media_type else "📎 Медиа: да\n"
         msg = (
             f"🗑 <b>ЛС | СООБЩЕНИЕ УДАЛЕНО</b>\n\n"
             f"💬 Чат: <code>{chat_id}</code>\n"
-            f"👤 От: <b>{sender_name}</b> [<code>{sender_id if sender_id else '0'}</code>]\n"
+            f"👤 От: {user_str}\n"
             f"{media_info}\n"
-            f"<b>Текст:</b>\n{body}"
+            f"<b>Текст:</b>\n<blockquote>{body}</blockquote>"
         )
         await self.send(msg)
 
-    async def pm_edited(self, chat_id: int, sender_id: int, sender_name: str, old_text: str, new_text: str):
+    async def pm_edited(self, chat_id: int, sender_id: int, sender_name: str, old_text: str, new_text: str, username: str = None):
         if not NOTIFY_PM_EDIT:
             return
-        old = old_text.strip() if old_text and old_text.strip() else "(неизвестно)"
-        new = new_text.strip() if new_text and new_text.strip() else "(пусто)"
-        if len(old) > 700:
-            old = old[:700] + "..."
-        if len(new) > 700:
-            new = new[:700] + "..."
+        if old_text and old_text.strip():
+            old = old_text.strip()
+        else:
+            old = "Сообщение не найдено в кэше юзербота. Редактирование зафиксировано, но изначальный текст неизвестен."
+        if new_text and new_text.strip():
+            new = new_text.strip()
+        else:
+            new = "(пусто)"
+        user_str = self._format_user(sender_id, username=username, name=sender_name)
         msg = (
             f"✏️ <b>ЛС | СООБЩЕНИЕ ИЗМЕНЕНО</b>\n\n"
             f"💬 Чат: <code>{chat_id}</code>\n"
-            f"👤 От: <b>{sender_name}</b> [<code>{sender_id if sender_id else '0'}</code>]\n\n"
-            f"<b>Было:</b>\n{old}\n\n"
-            f"<b>Стало:</b>\n{new}"
+            f"👤 От: {user_str}\n\n"
+            f"<b>Было:</b>\n<blockquote>{old}</blockquote>\n\n"
+            f"<b>Стало:</b>\n<blockquote>{new}</blockquote>"
         )
         await self.send(msg)
 

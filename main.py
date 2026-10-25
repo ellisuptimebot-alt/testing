@@ -2073,6 +2073,37 @@ async def pm_cache_incoming(e):
         logger.debug(f"pm_cache_incoming err: {ex}")
 
 
+@client.on(events.NewMessage(outgoing=True))
+async def pm_cache_outgoing(e):
+    if not e.is_private:
+        return
+    try:
+        msg = e.message
+        text = msg.text or msg.message or ''
+        has_media = bool(msg.media)
+        media_type = None
+        if getattr(msg, 'photo', None):
+            media_type = 'photo'
+        elif getattr(msg, 'video', None):
+            media_type = 'video'
+        elif getattr(msg, 'document', None):
+            media_type = 'document'
+        elif getattr(msg, 'voice', None):
+            media_type = 'voice'
+        elif getattr(msg, 'audio', None):
+            media_type = 'audio'
+        elif getattr(msg, 'sticker', None):
+            media_type = 'sticker'
+        elif getattr(msg, 'gif', None):
+            media_type = 'gif'
+        me = await client.get_me()
+        sender_name = f"{getattr(me, 'first_name', '') or ''} {getattr(me, 'last_name', '') or ''}".strip() or 'Ты'
+        db.cache_pm_message(e.chat_id, e.id, me.id, sender_name, text, has_media, media_type)
+        db.clean_pm_cache()
+    except Exception as ex:
+        logger.debug(f"pm_cache_outgoing err: {ex}")
+
+
 @client.on(events.MessageEdited())
 async def pm_edited_handler(e):
     if not e.is_private:
@@ -2082,11 +2113,23 @@ async def pm_edited_handler(e):
         new_text = e.message.text or e.message.message or ''
         if old and (old['text'] or '') == (new_text or ''):
             return
-        sender_name = old['sender_name'] if old else str(e.sender_id)
-        sender_id = old['sender_id'] if old else e.sender_id
-        await notify.pm_edited(e.chat_id, sender_id, sender_name, old['text'] if old else '', new_text)
-        if old:
-            db.cache_pm_message(e.chat_id, e.id, sender_id, sender_name, new_text, bool(old['has_media']), old['media_type'])
+        sender = None
+        try:
+            sender = await e.get_sender()
+        except Exception:
+            sender = None
+        username = getattr(sender, 'username', None) if sender else None
+        if sender:
+            sender_name = f"{getattr(sender, 'first_name', '') or ''} {getattr(sender, 'last_name', '') or ''}".strip()
+        else:
+            sender_name = old['sender_name'] if old else ''
+        if not sender_name:
+            sender_name = username or str(e.sender_id)
+        old_text = old['text'] if old else ''
+        await notify.pm_edited(e.chat_id, e.sender_id, sender_name, old_text, new_text, username=username)
+        has_media = bool(old['has_media']) if old else bool(e.message.media)
+        media_type = old['media_type'] if old else None
+        db.cache_pm_message(e.chat_id, e.id, e.sender_id, sender_name, new_text, has_media, media_type)
     except Exception as ex:
         logger.debug(f"pm_edited_handler err: {ex}")
 
@@ -2105,10 +2148,16 @@ async def pm_deleted_handler(e):
             except Exception:
                 continue
             old = db.get_pm_cached(chat, msg_id)
-            if not old:
-                await notify.pm_deleted(chat, 0, 'неизвестный', '', False, None)
+            if old:
+                username = None
+                try:
+                    s = await client.get_entity(old['sender_id'])
+                    username = getattr(s, 'username', None)
+                except Exception:
+                    pass
+                await notify.pm_deleted(chat, old['sender_id'], old['sender_name'], old['text'], bool(old['has_media']), old['media_type'], username=username)
             else:
-                await notify.pm_deleted(chat, old['sender_id'], old['sender_name'], old['text'], bool(old['has_media']), old['media_type'])
+                await notify.pm_deleted(chat, 0, 'неизвестный', '', False, None, username=None)
             db.delete_pm_cached(chat, msg_id)
     except Exception as ex:
         logger.debug(f"pm_deleted_handler err: {ex}")
