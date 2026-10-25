@@ -2522,6 +2522,15 @@ if __name__ == "__main__":
             logger.info("[TASK] pm_delete_worker запущен")
     except Exception as e:
         logger.warning(f"[TASK] pm_delete_worker не запущен: {e}")
+        # Принудительно подгружаем диалоги в память клиента, чтобы сервер присылал сырые апдейты
+    async def preload_dialogs():
+        try:
+            async for dialog in client.iter_dialogs(limit=50):
+                pass
+            logger.info("[INIT] Диалоги подгружены в память для отслеживания сырых апдейтов.")
+        except Exception as ex:
+            logger.warning(f"[INIT] Ошибка подгрузки диалогов: {ex}")
 
+    client.loop.create_task(preload_dialogs())
     print("✅ Бот запущен!")
     client.run_until_disconnected()
