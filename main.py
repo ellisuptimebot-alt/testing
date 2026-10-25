@@ -58,6 +58,40 @@ _pm_delete_queue = asyncio.Queue()
 _pm_delete_worker_started = False
 
 
+@client.on(events.RawUpdate())
+async def pm_delete_raw_update(e):
+    try:
+        u = e.update
+        if isinstance(u, types.UpdateDeleteMessages) and u.peer:
+            pid = getattr(u.peer, 'user_id', None)
+            cid = int(pid) if pid is not None else None
+            msg_ids = list(u.messages or [])
+            logger.info(f"[PM-DEL-RAW] UpdateDeleteMessages pid={pid} msg_count={len(msg_ids)}")
+            await ensure_pm_delete_worker()
+            for msg_id in msg_ids:
+                old = db.get_pm_cached(cid, msg_id)
+                username = None
+                if old and old.get('sender_id'):
+                    try:
+                        s = await client.get_entity(old['sender_id'])
+                        username = getattr(s, 'username', None)
+                    except Exception:
+                        pass
+                sid = e.sender_id if e.sender_id else 0
+                logger.info(f"[PM-DEL-RAW] Клад: chat={cid} msg={msg_id} has_old={bool(old)}")
+                await _pm_delete_queue.put({
+                    'chat_id': cid,
+                    'msg_id': msg_id,
+                    'old': old,
+                    'username': username,
+                    'event_sender_id': sid
+                })
+                await asyncio.sleep(0.01)
+    except Exception as ex:
+        logger.debug(f"[PM-DEL-RAW] err: {ex}")
+        pass
+
+
 async def _pm_delete_worker():
     while True:
         try:
@@ -2227,21 +2261,31 @@ async def pm_edited_handler(e):
 
 @client.on(events.MessageDeleted())
 async def pm_deleted_handler(e):
+    logger.info(f"[PM-DEL-DIAG] хендлер MessageDeleted вызван! e={type(e).__name__} keys={list(e.__dict__.keys())[:10]}")
     try:
         chat = e.chat_id
+        logger.info(f"[PM-DEL-DIAG] chat_id = {chat} (None? {chat is None})")
         if chat is None:
             return
         try:
             ent = await e.get_chat()
-            if not getattr(ent, 'is_user', False):
+            is_user = getattr(ent, 'is_user', False)
+            logger.info(f"[PM-DEL-DIAG] get_chat result: is_user={is_user}")
+            if not is_user:
+                logger.warning("[PM-DEL-DIAG] Не ЛС, пропускаю")
                 return
-        except Exception:
+        except Exception as ex:
+            logger.warning(f"[PM-DEL-DIAG] get_chat err: {ex}")
             return
 
-        ids = list(e.deleted_ids or [])
+        ids_raw = getattr(e, 'deleted_ids', None)
+        ids_alt = getattr(e, 'message_ids', None)
+        logger.info(f"[PM-DEL-DIAG] deleted_ids={ids_raw} message_ids={ids_alt}")
+
+        ids = list(ids_raw) if ids_raw else list(ids_alt) if ids_alt else []
+        logger.info(f"[PM-DEL-DIAG] ids={ids} (len={len(ids)})")
         if not ids:
             return
-        logger.info(f"[PM-DEL] Событие удаления в ЛС: chat={chat} ids={ids}")
 
         await ensure_pm_delete_worker()
 
@@ -2252,7 +2296,8 @@ async def pm_deleted_handler(e):
                 try:
                     s = await client.get_entity(old['sender_id'])
                     username = getattr(s, 'username', None)
-                except Exception:
+                except Exception as ex2:
+                    logger.debug(f"[PM-DEL] get_entity err: {ex2}")
                     pass
             else:
                 sid = e.sender_id if e.sender_id else 0
@@ -2267,7 +2312,7 @@ async def pm_deleted_handler(e):
             })
             await asyncio.sleep(0.01)
     except Exception as ex:
-        logger.debug(f"pm_deleted_handler err: {ex}")
+        logger.error(f"[PM-DEL-DIAG] ОШИБКА в pm_deleted_handler (проброшенная): {ex}", exc_info=True)
 
 
 # ── Online watch ──
