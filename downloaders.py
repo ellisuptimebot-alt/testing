@@ -13,6 +13,7 @@ import yt_dlp
 
 from config import MEDIA_DIR, logger, PROXY, PROXY_LIST
 from utils import format_bytes
+import ui
 
 _proxy_list = list(PROXY_LIST)
 _single_proxy = PROXY
@@ -979,7 +980,9 @@ async def _run_download_impl(event_edit_func, url, mode='video', quality=None, t
         logger.warning(f"[download] file not found or empty after download: {url}")
         return None
     except asyncio.TimeoutError:
-        await event_edit_func("❌ Превышено время ожидания (10 мин).")
+        await event_edit_func(ui.err("Превышено время ожидания (10 мин).",
+                                     title="Загрузка",
+                                     hint="`!dl <URL>` — повторить попытку"))
         logger.warning(f"Download timeout: {url}")
         return None
     except ValueError as ex:
@@ -989,11 +992,11 @@ async def _run_download_impl(event_edit_func, url, mode='video', quality=None, t
             invidious_path = await _try_invidious(url, mode)
             if invidious_path:
                 return invidious_path
-        await event_edit_func(f"❌ {ex}")
+        await event_edit_func(ui.err(f"{ex}", title="Загрузка"))
         return None
     except Exception as ex:
         logger.error(f"Download error: {ex}", exc_info=True)
-        await event_edit_func(f"❌ **Ошибка:** {ex}")
+        await event_edit_func(ui.err(f"{ex}", title="Загрузка"))
         return None
 
 
@@ -1009,9 +1012,10 @@ async def send_and_clean(event_edit_func, client, chat_id, filepath, caption='')
     except OSError:
         return
     if too_big:
-        await event_edit_func(f"❌ Слишком большой файл (> {_max_file_size} МБ).")
+        await event_edit_func(ui.err(f"Слишком большой файл (> {_max_file_size} МБ).",
+                                     title="Загрузка"))
     else:
-        await event_edit_func("📤 **Отправляю файл...**")
+        await event_edit_func(ui.card("📤 Отправка", "отправляю файл…"))
         sent = []
         failed = []
         for f in files:
@@ -1032,9 +1036,9 @@ async def send_and_clean(event_edit_func, client, chat_id, filepath, caption='')
                     failed.append((f, ex2))
         if failed:
             names = ", ".join(os.path.basename(f) for f, _ in failed)
-            await event_edit_func(f"❌ Не удалось отправить файл(ы): {names}")
+            await event_edit_func(ui.err(f"Не удалось отправить: {names}", title="Отправка"))
         elif sent:
-            await event_edit_func("✅ Файл(ы) отправлены")
+            await event_edit_func(ui.ok(f"Отправлено файлов: **{len(sent)}**"))
     await asyncio.sleep(5)
     for f in files:
         for _ in range(3):

@@ -44,6 +44,7 @@ from rp_commands import (
     get_category_commands, get_rp_reply,
 )
 from core import db, state, owner_filter, respond, _get_translator
+import ui
 
 set_max_file_size(MAX_FILE_SIZE_MB)
 
@@ -184,7 +185,7 @@ async def _pm_delete_worker():
                 media_type = None
 
             logger.info(f"[PM-DEL-WORKER] Отправляю уведомление: from={sender_id} name={sender_name} txt_len={len(text)} cache={bool(old)}")
-            res = await notify.pm_deleted(chat_id, sender_id, sender_name, text, has_media, media_type, username=username)
+            res = await notify.pm_deleted(chat_id, sender_id, sender_name, text, has_media, media_type, username=username, cached=bool(old))
             logger.info(f"[PM-DEL-WORKER] Результат отправки: {res}")
 
             try:
@@ -279,6 +280,47 @@ async def pm_presence_watcher(interval=45, max_age=259200, chats_per_cycle=20, i
 
 
 
+# ── Разрешение цели команды: '@user' / 'user' / числовой ID ──
+# (у многих юзернейма нет — тогда target указывается числом)
+
+async def resolve_entity(target):
+    t = (target or '').strip()
+    if not t:
+        raise ValueError('не указан пользователь')
+    if re.fullmatch(r'-?\d+', t):
+        try:
+            return await client.get_entity(int(t))
+        except Exception:
+            # id может не найтись в кэше сессии — пробуем строковым ключом
+            return await client.get_entity(t)
+    uname = t.lstrip('@').lower()
+    try:
+        # сначала штатно (имя, юзернейм, телефон, id) — работает если юзер уже в диалогах
+        return await client.get_entity(t.lstrip('@'))
+    except Exception:
+        pass
+    try:
+        # @lucky_m_01 vs lucky_M_01: Telegram сравнивает username в диалогах
+        # регистрозависимо, поэтому ищем вручную по нижнему регистру
+        async for d in client.iter_dialogs():
+            u = getattr(d.entity, 'username', None)
+            if u and u.lower() == uname:
+                return d.entity
+    except Exception:
+        pass
+    raise ValueError(f'пользователь {t} не найден (нет в диалогах или ошибка сети)')
+
+
+def entity_label(ent, fallback=None):
+    """@username, а если его нет — id."""
+    u = getattr(ent, 'username', None)
+    if u:
+        return f'@{u}'
+    if fallback:
+        return fallback
+    return f'id{getattr(ent, "id", "")}'
+
+
 app = Flask(__name__)
 
 @app.route('/')
@@ -292,61 +334,97 @@ def run_web():
 async def sleep_cmd(e):
 
     state.toggle_auto_reply(True)
-    await respond(e, '💤 Автоответчик **ВКЛЮЧЕН**.')
+    await respond(e, ui.card("💤 Автоответчик",
+                             ui.rows(("Статус", "включён ✅"),
+                                     ("Что делает", "отвечает на входящие ЛС"))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!wake$', func=owner_filter))
 async def wake_cmd(e):
 
     state.toggle_auto_reply(False)
-    await respond(e, '☀️ Автоответчик **ВЫКЛЮЧЕН**.')
+    await respond(e, ui.card("💤 Автоответчик",
+                             ui.rows(("Статус", "выключен ❌"),
+                                     ("Что делает", "ЛС без ответа"))))
     db.bump_stat('cmds')
 
-@client.on(events.NewMessage(pattern=r'!setreply(?:\s+(@\w+))?(?:\s+(.+))?', func=owner_filter))
+@client.on(events.NewMessage(pattern=r'!setreply(?:\s+(@?\w+))?(?:\s+(.+))?', func=owner_filter))
 async def setreply_cmd(e):
 
     g = e.pattern_match
     target, text = g.group(1), g.group(2)
-    if target and target.lower() == '@default':
+    # Одиночный аргумент без '@' и не число/не default — это текст глобального
+    # автоответа ('!setreply привет'), а не ник. Так работало и раньше.
+    if target and not (target.startswith('@') or target.isdigit() or target.lower() == 'default'):
+        text = f"{target} {text}".strip() if text else target
+        target = None
+    if target and target.lower().lstrip('@') == 'default':
         db.set_default_reply(text or '')
-        await respond(e, f"✅ Дефолтный ответ установлен:\n_{text or 'пусто'}_")
+        await respond(e, ui.card("💬 Дефолтный ответ",
+                                 ui.rows(("Текст", text or "пусто")),
+                                 hint="!setreply default <текст>"))
     elif target:
-        db.set_reply_text(target.lstrip('@'), text or '')
-        await respond(e, f"✅ Ответ для {target} установлен:\n_{text or 'пусто'}_")
+        try:
+            ent = await resolve_entity(target)
+        except Exception as ex:
+            await respond(e, ui.err(f"Не удалось найти `{target}`: {ex}",
+                                    title="Пользователь не найден",
+                                    hint="Можно указать числовой ID: `!setreply 12345 текст`"))
+            db.bump_stat('cmds')
+            return
+        # автоответчик ищет ответ по числовому id отправителя, поэтому
+        # храним именно id, а не ник (иначе правило никогда не срабатывало)
+        db.set_reply_text(ent.id, text or '')
+        await respond(e, ui.card("💬 Ответ установлен",
+                                 ui.rows(("Кому", entity_label(ent, target.lstrip('@'))),
+                                         ("Текст", text or "пусто"))))
     elif text:
         state.set_auto_reply_text(text)
-        await respond(e, f"✅ Текст автоответчика:\n_{text}_")
+        await respond(e, ui.card("💬 Автоответчик",
+                                 ui.rows(("Текст", text))))
     else:
-        await respond(e, "ℹ️ `!setreply @username текст` или `!setreply default текст`")
+        await respond(e, ui.usage("!setreply текст",
+                                  "!setreply @username|ID текст",
+                                  "!setreply default текст"))
     db.bump_stat('cmds')
 
-@client.on(events.NewMessage(pattern=r'!status$', func=owner_filter))
-async def status_cmd(e):
-
+async def build_status_card():
     me = await client.get_me()
     dialogs = await client.get_dialogs()
     s = db.all_stats()
-    afk_status = f"✅ {state.afk_reason or 'без причины'}" if state.afk_start_time else "❌"
-    await respond(e, 
-        f"📊 **Статус UserBot**\n\n"
-        f"👤 {me.first_name} {me.last_name or ''}\n"
-        f"💬 Чатов: `{len(dialogs)}`\n"
-        f"🤖 Автоответчик: {'💤 Вкл' if state.auto_reply_enabled else '☀️ Выкл'}\n"
-        f"👻 Ghost: {'✅' if state.ghost_mode else '❌'}\n"
-        f"🔇 Cover: {'✅' if state.cover_enabled else '❌'}\n"
-        f"🤐 Silent: {'✅' if state.silent_enabled else '❌'}\n"
-        f"👤 Shadow: {'✅' if state.shadow_enabled else '❌'}\n"
-        f"🔒 Lock: {'✅' if state.lock_enabled else '❌'}\n"
-        f"🔇 Mute: {'✅' if state.mute_enabled else '❌'}\n"
-        f"⌨️ Тайпинг: {'✅' if state.typing_enabled else '❌'}\n"
-        f"🗑️ Автоудал: {'✅' if state.autodel_enabled else '❌'}\n"
-        f"⏳ Задержка: `{state.reply_delay}с`\n"
-        f"👁️ Прочтение: {'✅' if state.readreceipt_enabled else '❌'}\n"
-        f"😴 AFK: {afk_status}\n"
-        f"👑 Sudo: `{len(state.sudo_users)}`\n"
-        f"⏱ Аптайм: `{state.uptime}`\n"
-        f"📨 Команд выполнено: `{s.get('cmds', 0)}`"
+    afk_status = f"вкл — {state.afk_reason or 'без причины'}" if state.afk_start_time else "выкл ❌"
+
+    def _yn(v):
+        return "вкл ✅" if v else "выкл ❌"
+
+    return ui.card(
+        "📊 Статус UserBot",
+        ui.rows(
+            ("Профиль", f"{me.first_name} {me.last_name or ''}".strip(), "👤"),
+            ("Чатов", f"`{len(dialogs)}`", "💬"),
+            ("Автоответчик", ("💤 " if state.auto_reply_enabled else "☀️ ") + _yn(state.auto_reply_enabled), "🤖"),
+            ("Ghost", _yn(state.ghost_mode), "👻"),
+            ("Cover", _yn(state.cover_enabled), "🛡️"),
+            ("Silent", _yn(state.silent_enabled), "🤐"),
+            ("Shadow", _yn(state.shadow_enabled), "👤"),
+            ("Lock", _yn(state.lock_enabled), "🔒"),
+            ("Mute", _yn(state.mute_enabled), "🔇"),
+            ("Тайпинг", _yn(state.typing_enabled), "⌨️"),
+            ("Автоудаление", _yn(state.autodel_enabled), "🗑️"),
+            ("Задержка ответа", f"`{state.reply_delay}с`", "⏳"),
+            ("Прочтение", _yn(state.readreceipt_enabled), "👁️"),
+            ("AFK", afk_status, "😴"),
+            ("Sudo", f"`{len(state.sudo_users)}`", "👑"),
+            ("Аптайм", f"`{state.uptime}`", "⏱"),
+            ("Команд выполнено", f"`{s.get('cmds', 0)}`", "📨"),
+        ),
+        hint="`!help` — справка по командам",
     )
+
+
+@client.on(events.NewMessage(pattern=r'!status$', func=owner_filter))
+async def status_cmd(e):
+    await respond(e, await build_status_card())
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!time$', func=owner_filter))
@@ -355,13 +433,15 @@ async def time_cmd(e):
     now = datetime.datetime.now()
     utc = datetime.datetime.utcnow()
     week_days = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье']
-    await respond(e, 
-        f"🕐 **Время и дата**\n\n"
-        f"🏠 Локальное: `{now.strftime('%H:%M:%S')}`\n"
-        f"🌍 UTC: `{utc.strftime('%H:%M:%S')}`\n"
-        f"📅 Дата: `{now.strftime('%d.%m.%Y')}`\n"
-        f"📆 День: **{week_days[now.weekday()]}**"
-    )
+    await respond(e, ui.card(
+        "🕐 Время и дата",
+        ui.rows(
+            ("Локальное", f"`{now.strftime('%H:%M:%S')}`", "🏠"),
+            ("UTC", f"`{utc.strftime('%H:%M:%S')}`", "🌍"),
+            ("Дата", f"`{now.strftime('%d.%m.%Y')}`", "📅"),
+            ("День", week_days[now.weekday()], "📆"),
+        ),
+    ))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!ping$', func=owner_filter))
@@ -371,26 +451,29 @@ async def ping_cmd(e):
     await respond(e, "🏓 ...")
     ms = (time.monotonic() - t0) * 1000
     q = "🟢 Отлично" if ms < 150 else "🟡 Нормально" if ms < 400 else "🔴 Высокая"
-    await respond(e, f"🏓 **Понг!**\n⚡ Задержка: `{ms:.1f} мс`\n📶 Качество: {q}")
+    await respond(e, ui.card("🏓 Понг!",
+                             ui.rows(("Задержка", f"`{ms:.1f} мс`", "⚡"),
+                                     ("Качество", q, "📶"))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!id$', func=owner_filter))
 async def id_cmd(e):
 
     chat = await e.get_chat()
-    lines = [f"🆔 **ID чата:** `{chat.id}`"]
+    lines = [ui.kv("ID чата", f"`{chat.id}`", "🆔")]
     if e.reply_to_msg_id:
         r = await e.get_reply_message()
         lines += [
-            f"👤 **ID отправителя:** `{r.sender_id}`",
-            f"📨 **ID сообщения:** `{r.id}`",
+            ui.kv("ID отправителя", f"`{r.sender_id}`", "👤"),
+            ui.kv("ID сообщения", f"`{r.id}`", "📨"),
         ]
         if r.sender and getattr(r.sender, 'username', None):
-            lines.append(f"🔖 **Username:** @{r.sender.username}")
+            lines.append(ui.kv("Username", f"@{r.sender.username}", "🔖"))
     else:
         me = await client.get_me()
-        lines.append(f"👤 **Мой ID:** `{me.id}`")
-    await respond(e, "\n".join(lines))
+        lines.append(ui.kv("Мой ID", f"`{me.id}`", "👤"))
+    await respond(e, ui.card("🆔 ID", "\n".join(lines),
+                             hint="Ответьте на сообщение, чтобы узнать его ID"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!info$', func=owner_filter))
@@ -398,22 +481,25 @@ async def info_cmd(e):
 
     me = await client.get_me()
     dialogs = await client.get_dialogs()
-    await respond(e, 
-        f"🚀 **UserBot Info**\n\n"
-        f"👤 {me.first_name} {me.last_name or ''}\n"
-        f"🆔 ID: `{me.id}`\n"
-        f"🔰 @{me.username or 'нет'}\n"
-        f"📱 Телефон: `{me.phone or 'скрыт'}`\n"
-        f"💬 Чатов: `{len(dialogs)}`\n"
-        f"⏱ Аптайм: `{state.uptime}`\n"
-        f"⚡ Статус: **Активен** ✅"
-    )
+    await respond(e, ui.card(
+        "🚀 UserBot Info",
+        ui.rows(
+            ("Имя", f"{me.first_name} {me.last_name or ''}".strip(), "👤"),
+            ("ID", f"`{me.id}`", "🆔"),
+            ("Username", f"@{me.username}" if me.username else "нет", "🔰"),
+            ("Телефон", f"`{me.phone}`" if me.phone else "скрыт", "📱"),
+            ("Чатов", f"`{len(dialogs)}`", "💬"),
+            ("Аптайм", f"`{state.uptime}`", "⏱"),
+            ("Статус", "активен ✅", "⚡"),
+        ),
+        hint="`!status` — детальный статус режимов",
+    ))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!restart$', func=owner_filter))
 async def restart_cmd(e):
 
-    await respond(e, '🔄 Перезагрузка...')
+    await respond(e, ui.card("🔄 Перезапуск", "Бот перезупускается…"))
     await asyncio.sleep(2)
     await client.disconnect()
     os._exit(0)
@@ -423,11 +509,13 @@ async def ghost_cmd(e):
 
     state.toggle_ghost()
     if state.ghost_mode:
-        await respond(e, "👻 **Ghost-режим ВКЛЮЧЁН** — команды удаляются мгновенно")
+        await respond(e, ui.card("👻 Ghost-режим",
+                                 ui.rows(("Статус", "включён ✅"),
+                                         ("Что делает", "команды удаляются мгновенно"))))
         await asyncio.sleep(2)
         await e.delete()
     else:
-        await respond(e, "👁 **Ghost-режим ВЫКЛЮЧЕН**")
+        await respond(e, ui.card("👻 Ghost-режим", ui.rows(("Статус", "выключен ❌"))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!cover(?:\s+(off|on))?$', func=owner_filter))
@@ -435,10 +523,14 @@ async def cover_cmd(e):
     arg = e.pattern_match.group(1)
     if arg == 'off':
         state.set_cover(False)
-        await respond(e, "🛡️ **Cover-режим ВЫКЛЮЧЕН** — команды снова работают.")
+        await respond(e, ui.card("🛡️ Cover-режим",
+                                 ui.rows(("Статус", "выключен ❌"),
+                                         ("Что делает", "команды снова работают"))))
     else:
         state.set_cover(True)
-        await respond(e, "🛡️ **Cover-режим ВКЛЮЧЁН** — все команды, кроме `!cover off`, игнорируются.")
+        await respond(e, ui.card("🛡️ Cover-режим",
+                                 ui.rows(("Статус", "включён ✅"),
+                                         ("Что делает", "все команды, кроме `!cover off`, игнорируются"))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!silent\s*(on|off)?$', func=owner_filter))
@@ -446,10 +538,14 @@ async def silent_cmd(e):
     arg = e.pattern_match.group(1)
     if arg == 'off':
         state.set_silent(False)
-        await respond(e, "🔇 **Silent-режим ВЫКЛЮЧЕН** — ответы снова отправляются.")
+        await respond(e, ui.card("🤐 Silent-режим",
+                                 ui.rows(("Статус", "выключен ❌"),
+                                         ("Что делает", "ответы снова отправляются"))))
     else:
         state.set_silent(True)
-        await respond(e, "🔇 **Silent-режим ВКЛЮЧЁН** — бот молчит в ЛС.")
+        await respond(e, ui.card("🤐 Silent-режим",
+                                 ui.rows(("Статус", "включён ✅"),
+                                         ("Что делает", "бот молчит в ЛС"))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!shadow(?:\s+(\d+))?$', func=owner_filter))
@@ -458,13 +554,20 @@ async def shadow_cmd(e):
     if delay:
         d = int(delay)
         state.set_shadow(True, max(1, d))
-        await respond(e, f"👤 **Shadow-режим ВКЛЮЧЁН** — удаление через {max(1, d)} сек.")
+        await respond(e, ui.card("👤 Shadow-режим",
+                                 ui.rows(("Статус", "включён ✅"),
+                                         ("Удаление ответов", f"через `{max(1, d)}с`"))))
     elif state.shadow_enabled:
         state.set_shadow(False)
-        await respond(e, "👤 **Shadow-режим ВЫКЛЮЧЕН** — автодудаление отключено.")
+        await respond(e, ui.card("👤 Shadow-режим",
+                                 ui.rows(("Статус", "выключен ❌"),
+                                         ("Что делает", "автоудаление ответов отключено"))))
     else:
         state.set_shadow(True)
-        await respond(e, "👤 **Shadow-режим ВКЛЮЧЁН** — удаление через 5 сек.")
+        await respond(e, ui.card("👤 Shadow-режим",
+                                 ui.rows(("Статус", "включён ✅ (по умолчанию)"),
+                                         ("Удаление ответов", "через `5с`"),
+                                         ("Смена", "`!shadow <сек>`"))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!lock(?:\s+(on|off))?$', func=owner_filter))
@@ -472,10 +575,14 @@ async def lock_cmd(e):
     arg = e.pattern_match.group(1)
     if arg == 'off':
         state.set_lock(False)
-        await respond(e, "🔒 **Lock-режим ВЫКЛЮЧЕН** — ЛС от всех открыты.")
+        await respond(e, ui.card("🔒 Lock-режим",
+                                 ui.rows(("Статус", "выключен ❌"),
+                                         ("Что делает", "ЛС от всех открыты"))))
     else:
         state.set_lock(True)
-        await respond(e, "🔒 **Lock-режим ВКЛЮЧЁН** — бот отвечает только контактам.")
+        await respond(e, ui.card("🔒 Lock-режим",
+                                 ui.rows(("Статус", "включён ✅"),
+                                         ("Что делает", "бот отвечает только контактам"))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!mute(?:\s+(on|off))?$', func=owner_filter))
@@ -483,10 +590,14 @@ async def mute_cmd(e):
     arg = e.pattern_match.group(1)
     if arg == 'off':
         state.set_mute(False)
-        await respond(e, "🔇 **Mute-режим ВЫКЛЮЧЕН** — ЛС принимаются.")
+        await respond(e, ui.card("🔇 Mute-режим",
+                                 ui.rows(("Статус", "выключен ❌"),
+                                         ("Что делает", "ЛС принимаются"))))
     else:
         state.set_mute(True)
-        await respond(e, "🔇 **Mute-режим ВКЛЮЧЁН** — все ЛС игнорируются.")
+        await respond(e, ui.card("🔇 Mute-режим",
+                                 ui.rows(("Статус", "включён ✅"),
+                                         ("Что делает", "все ЛС игнорируются"))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!typing(?:\s+(on|off))?$', func=owner_filter))
@@ -495,10 +606,14 @@ async def typing_cmd(e):
     arg = e.pattern_match.group(1)
     if arg == 'off':
         state.set_typing(False)
-        await respond(e, "⌨️ **Тайпинг ВЫКЛЮЧЕН** — индикатор печати не показывается.")
+        await respond(e, ui.card("⌨️ Тайпинг",
+                                 ui.rows(("Статус", "выключен ❌"),
+                                         ("Что делает", "индикатор «печатает…» не показывается"))))
     else:
         state.set_typing(True)
-        await respond(e, "⌨️ **Тайпинг ВКЛЮЧЁН** — перед ответом показывается «печатает...».")
+        await respond(e, ui.card("⌨️ Тайпинг",
+                                 ui.rows(("Статус", "включён ✅"),
+                                         ("Что делает", "перед ответом показывается «печатает…»"))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!autodel(?:\s+(on|off))?(?:\s+(\d+))?$', func=owner_filter))
@@ -508,11 +623,16 @@ async def autodel_cmd(e):
     delay_str = e.pattern_match.group(2)
     if arg == 'off':
         state.set_autodel(False)
-        await respond(e, "🗑️ **Автоудаление ВЫКЛЮЧЕНО** — сообщения не удаляются.")
+        await respond(e, ui.card("🗑️ Автоудаление",
+                                 ui.rows(("Статус", "выключено ❌"),
+                                         ("Что делает", "сообщения не удаляются"))))
     else:
         d = int(delay_str) if delay_str else 10
         state.set_autodel(True, max(3, d))
-        await respond(e, f"🗑️ **Автоудаление ВКЛЮЧЕНО** — удаление через {max(3, d)} сек.")
+        await respond(e, ui.card("🗑️ Автоудаление",
+                                 ui.rows(("Статус", "включено ✅"),
+                                         ("Удаление", f"через `{max(3, d)}с`"),
+                                         ("Смена", "`!autodel on|off [сек]`"))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!delay\s+(\d+)', func=owner_filter))
@@ -521,9 +641,12 @@ async def delay_cmd(e):
     sec = int(e.pattern_match.group(1))
     state.set_reply_delay(min(sec, 30))
     if state.reply_delay > 0:
-        await respond(e, f"⏳ **Задержка ответа: {state.reply_delay} сек.**")
+        await respond(e, ui.card("⏳ Задержка ответа",
+                                 ui.rows(("Задержка", f"`{state.reply_delay}с`"),
+                                         ("Что делает", "имитация живого ответа"))))
     else:
-        await respond(e, "⏳ **Задержка ответа ВЫКЛЮЧЕНА.**")
+        await respond(e, ui.card("⏳ Задержка ответа",
+                                 ui.rows(("Статус", "выключена ❌"))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!readreceipt(?:\s+(on|off))?$', func=owner_filter))
@@ -532,10 +655,14 @@ async def readreceipt_cmd(e):
     arg = e.pattern_match.group(1)
     if arg == 'off':
         state.set_readreceipt(False)
-        await respond(e, "👁️ **Прочтение ВЫКЛЮЧЕНО** — сообщения остаются непрочитанными.")
+        await respond(e, ui.card("👁️ Прочтение",
+                                 ui.rows(("Статус", "выключено ❌"),
+                                         ("Что делает", "сообщения остаются непрочитанными"))))
     else:
         state.set_readreceipt(True)
-        await respond(e, "👁️ **Прочтение ВКЛЮЧЕНО** — сообщения отмечаются прочитанными.")
+        await respond(e, ui.card("👁️ Прочтение",
+                                 ui.rows(("Статус", "включено ✅"),
+                                         ("Что делает", "сообщения отмечаются прочитанными"))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!sudo(?:\s+(on|off)\s+(\S+))?\s*$', func=owner_filter))
@@ -546,7 +673,7 @@ async def sudo_cmd(e):
     target = g.group(2)
     if not action:
         if state.sudo_users:
-            lines = ["👑 **Sudo-пользователи:**\n"]
+            lines = []
             for uid in list(state.sudo_users):
                 try:
                     ent = await client.get_entity(uid)
@@ -555,30 +682,34 @@ async def sudo_cmd(e):
                     lines.append(f"• {name}{uname} (`{uid}`)")
                 except Exception:
                     lines.append(f"• `{uid}`")
-            await respond(e, "\n".join(lines))
+            await respond(e, ui.card("👑 Sudo-пользователи", "\n".join(lines),
+                                     hint="`!sudo off @username|ID` — снять доступ"))
         else:
-            await respond(e, "👑 **Sudo-пользователи отсутствуют.**")
+            await respond(e, ui.card("👑 Sudo-пользователи", "список пуст",
+                                     hint="`!sudo on @username|ID` — выдать доступ"))
         db.bump_stat('cmds')
         return
     try:
-        ent = await client.get_entity(target)
+        ent = await resolve_entity(target)
     except Exception as ex:
-        await respond(e, f"❌ Пользователь {target} не найден: {ex}")
+        await respond(e, ui.err(f"Пользователь `{target}` не найден: {ex}",
+                                title="Sudo",
+                                hint="Формат: `!sudo on @username|ID`"))
         db.bump_stat('cmds')
         return
     name = getattr(ent, 'first_name', '') or str(ent.id)
     if action == 'on':
         state.add_sudo(ent.id)
-        await respond(e, f"👑 **{name}** добавлен в sudo.")
+        await respond(e, ui.ok(ui.kv("Пользователь", f"**{name}**"), title="Добавлен в sudo"))
     else:
         state.remove_sudo(ent.id)
-        await respond(e, f"👑 **{name}** удалён из sudo.")
+        await respond(e, ui.ok(ui.kv("Пользователь", f"**{name}**"), title="Удалён из sudo"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!status_reset$', func=owner_filter))
 async def status_reset_cmd(e):
     state.reset_stealth()
-    await respond(e, "🔄 **Все стелс-режимы сброшены**: cover, silent, shadow, lock, mute — выключены.")
+    await respond(e, ui.ok("Выключены: cover, silent, shadow, lock, mute.", title="Режимы сброшены"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!me$', func=owner_filter))
@@ -586,16 +717,19 @@ async def me_cmd(e):
 
     me = await client.get_me()
     photos = await client.get_profile_photos(me.id, limit=1)
-    await respond(e, 
-        f"👤 **Мой профиль**\n\n"
-        f"📛 {me.first_name} {me.last_name or ''}\n"
-        f"🆔 `{me.id}`\n"
-        f"🔰 @{me.username or 'нет'}\n"
-        f"📱 `{me.phone or 'скрыт'}`\n"
-        f"🖼 Аватар: {'✅' if photos else '❌'}\n"
-        f"✔️ Verified: {'✅' if me.verified else '❌'}\n"
-        f"🤖 Бот: {'✅' if me.bot else '❌'}"
-    )
+    await respond(e, ui.card(
+        "👤 Мой профиль",
+        ui.rows(
+            ("Имя", f"{me.first_name} {me.last_name or ''}".strip(), "📛"),
+            ("ID", f"`{me.id}`", "🆔"),
+            ("Username", f"@{me.username}" if me.username else "нет", "🔰"),
+            ("Телефон", f"`{me.phone}`" if me.phone else "скрыт", "📱"),
+            ("Аватар", "есть ✅" if photos else "нет ❌", "🖼"),
+            ("Verified", "да ✅" if me.verified else "нет ❌", "✔️"),
+            ("Бот", "да ✅" if me.bot else "нет ❌", "🤖"),
+        ),
+        hint="`!avatar`, `!name`, `!lastname`, `!bio` — изменить профиль",
+    ))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!avatar$', func=owner_filter))
@@ -611,7 +745,8 @@ async def avatar_cmd(e):
         await e.reply(file=photos[0])
         await e.delete()
     else:
-        await respond(e, "❌ Аватарка не найдена")
+        await respond(e, ui.err("Аватарка не найдена",
+                                hint="Ответьте на чужое сообщение, чтобы получить его аватарку"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!name (.+)', func=owner_filter))
@@ -619,7 +754,7 @@ async def name_cmd(e):
 
     n = e.pattern_match.group(1).strip()
     await client.edit_profile(first_name=n)
-    await respond(e, f"✅ Имя → **{n}**")
+    await respond(e, ui.ok(ui.kv("Имя", f"**{n}**"), title="Имя изменено"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!lastname(?:\s+(.+))?$', func=owner_filter))
@@ -627,7 +762,8 @@ async def lastname_cmd(e):
 
     n = (e.pattern_match.group(1) or '').strip()
     await client.edit_profile(last_name=n)
-    await respond(e, f"✅ Фамилия → **{n}**" if n else "✅ Фамилия удалена")
+    await respond(e, ui.ok(ui.kv("Фамилия", f"**{n}**"), title="Фамилия изменена")
+                   if n else ui.ok("Фамилия удалена", title="Профиль"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!bio(?:\s+(.+))?$', func=owner_filter))
@@ -635,42 +771,77 @@ async def bio_cmd(e):
 
     t = (e.pattern_match.group(1) or '').strip()
     await client.edit_profile(about=t)
-    await respond(e, f"✅ Био → _{t}_" if t else "✅ Био очищено")
+    await respond(e, ui.ok(ui.kv("Био", f"_{t}_"), title="Био обновлено")
+                   if t else ui.ok("Био очищено", title="Профиль"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!whois (.+)', func=owner_filter))
 async def whois_cmd(e):
 
-    target = e.pattern_match.group(1).strip().lstrip('@')
+    target = e.pattern_match.group(1).strip()
     try:
-        ent = await client.get_entity(target)
+        ent = await resolve_entity(target)
         name = f"{getattr(ent, 'first_name', '') or ''} {getattr(ent, 'last_name', '') or ''}".strip() \
                or getattr(ent, 'title', '?')
         uname = f"@{ent.username}" if getattr(ent, 'username', None) else "нет"
         bot_ = "✅" if getattr(ent, 'bot', False) else "❌"
         ver = "✅" if getattr(ent, 'verified', False) else "❌"
-        await respond(e, 
-            f"🔍 **Информация о пользователе**\n\n"
-            f"📛 Имя: **{name}**\n"
-            f"🆔 ID: `{ent.id}`\n"
-            f"🔰 Username: {uname}\n"
-            f"🤖 Бот: {bot_}\n"
-            f"✔️ Verified: {ver}"
-        )
+        await respond(e, ui.card(
+            "🔍 Пользователь",
+            ui.rows(
+                ("Имя", f"**{name}**", "📛"),
+                ("ID", f"`{ent.id}`", "🆔"),
+                ("Username", uname, "🔰"),
+                ("Бот", bot_, "🤖"),
+                ("Verified", ver, "✔️"),
+            ),
+            hint="`!username_check @ник|ID` — проверить username",
+        ))
     except Exception as ex:
-        await respond(e, f"❌ Не найден: {ex}")
+        await respond(e, ui.err(f"Не найден `{target}`: {ex}",
+                                title="Пользователь",
+                                hint="Формат: `!whois @username|ID`"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!username_check (.+)', func=owner_filter))
 async def username_check_cmd(e):
 
-    uname = e.pattern_match.group(1).strip().lstrip('@')
+    raw = e.pattern_match.group(1).strip()
+    if raw.lstrip('-').isdigit():
+        # числовой ID: смотрим, есть ли у этого пользователя юзернейм
+        try:
+            ent = await resolve_entity(raw)
+            name = getattr(ent, 'first_name', None) or getattr(ent, 'title', '?')
+            uname = getattr(ent, 'username', None)
+            await respond(e, ui.card(
+                "🔍 Проверка username",
+                ui.rows(
+                    ("ID", f"`{ent.id}`", "🆔"),
+                    ("Имя", name, "👤"),
+                    ("Username", f"@{uname}" if uname else "отсутствует", "🔰"),
+                    ("Статус", "занят ⚠️" if uname else "свободен ✅", "ℹ️"),
+                ),
+            ))
+        except Exception as ex:
+            await respond(e, ui.err(f"ID `{raw}` не найден: {ex}", title="Пользователь"))
+        db.bump_stat('cmds')
+        return
     try:
-        ent = await client.get_entity(uname)
+        ent = await resolve_entity(raw)
         name = getattr(ent, 'first_name', None) or getattr(ent, 'title', '?')
-        await respond(e, f"🔍 @{uname}\n✅ **Занят**\n👤 {name}\n🆔 `{ent.id}`")
+        await respond(e, ui.card(
+            "🔍 Проверка username",
+            ui.rows(
+                ("Username", entity_label(ent, raw.lstrip('@')), "🔰"),
+                ("Статус", "занят ✅", "ℹ️"),
+                ("Имя", name, "👤"),
+                ("ID", f"`{ent.id}`", "🆔"),
+            ),
+        ))
     except Exception:
-        await respond(e, f"🔍 @{uname}\n✅ **Свободен**")
+        await respond(e, ui.card("🔍 Проверка username",
+                                 ui.rows(("Username", raw, "🔰"),
+                                         ("Статус", "свободен ✅", "ℹ️"))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!dice$', func=owner_filter))
@@ -721,7 +892,9 @@ async def coin_cmd(e):
     sides = ["Орёл 🦅", "Решка 💰"]
     r = random.choice(sides)
     flips = random.randint(3, 9)
-    await respond(e, f"🪙 Монета вращается {flips} раз...\n\nРезультат: **{r}**")
+    await respond(e, ui.card("🪙 Монета",
+                             ui.rows(("Бросков", f"`{flips}`"),
+                                     ("Результат", f"**{r}**"))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!rand(?:\s+(-?\d+)(?:\s+(-?\d+))?)?$', func=owner_filter))
@@ -731,11 +904,17 @@ async def rand_cmd(e):
     a, b = g.group(1), g.group(2)
     if a and b:
         lo, hi = sorted([int(a), int(b)])
-        await respond(e, f"🎲 `{lo}` … `{hi}` → **{random.randint(lo, hi)}**")
+        await respond(e, ui.card("🎲 Случайное число",
+                                 ui.rows(("Диапазон", f"`{lo}` … `{hi}`"),
+                                         ("Результат", f"**{random.randint(lo, hi)}**"))))
     elif a:
-        await respond(e, f"🎲 `1` … `{a}` → **{random.randint(1, int(a))}**")
+        await respond(e, ui.card("🎲 Случайное число",
+                                 ui.rows(("Диапазон", f"`1` … `{a}`"),
+                                         ("Результат", f"**{random.randint(1, int(a))}**"))))
     else:
-        await respond(e, f"🎲 **{random.randint(1, 100)}**")
+        await respond(e, ui.card("🎲 Случайное число",
+                                 ui.rows(("Диапазон", "`1` … `100`"),
+                                         ("Результат", f"**{random.randint(1, 100)}**"))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!8ball(?:\s+(.+))?$', func=owner_filter))
@@ -790,16 +969,14 @@ async def eightball_cmd(e):
     label = {"pos": "ПОЗИТИВНЫЙ", "neu": "НЕЙТРАЛЬНЫЙ", "neg": "НЕГАТИВНЫЙ"}[pool_key]
     confidence = random.randint(55, 99)
     bar = progress_bar(confidence, 100, 10)
-    q_line = f"❓ _{question}_\n\n" if question else ""
+    q_line = f"❓ _{question}\n\n" if question else ""
     await msg.edit(
-        f"🎱 **Магический шар**\n\n"
-        f"{q_line}"
-        f"{'─'*22}\n"
-        f"{emoji}  **{answer}**\n"
-        f"{'─'*22}\n\n"
-        f"💬 _{comment}_\n\n"
-        f"{color} {label}\n"
-        f"[{bar}] **{confidence}%** уверенности"
+        ui.card("🎱 Магический шар",
+                f"{q_line}"
+                f"{emoji}  **{answer}**\n"
+                f"💬 _{comment}_\n\n"
+                f"{color} {label}\n"
+                f"[{bar}] **{confidence}%** уверенности")
     )
     db.bump_stat('cmds')
 
@@ -811,7 +988,9 @@ async def rps_cmd(e):
     WIN = {'🪨 Камень': '✂️ Ножницы', '✂️ Ножницы': '📄 Бумага', '📄 Бумага': '🪨 Камень'}
     arg = (e.pattern_match.group(1) or '').lower().strip()
     if not arg or arg not in MAP:
-        await respond(e, "✊✌️🖐 `!rps камень` / `ножницы` / `бумага` (или `к`!`н`!`б`)")
+        await respond(e, ui.card("✊✌️🖐 КНБ",
+                                 "`!rps камень` / `ножницы` / `бумага`",
+                                 hint="Коротко: `к`, `н`, `б`"))
         return
     uc, bc = MAP[arg], random.choice(BOT)
     if uc == bc:
@@ -820,7 +999,9 @@ async def rps_cmd(e):
         res = "🏆 **Ты победил!**"
     else:
         res = "💀 **Бот победил!**"
-    await respond(e, f"✊✌️🖐 **КНБ**\n\n👤 Ты: {uc}\n🤖 Бот: {bc}\n\n{res}")
+    await respond(e, ui.card("✊✌️🖐 КНБ",
+                             ui.rows(("Ты", uc, "👤"), ("Бот", bc, "🤖")),
+                             footer=res))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!slot$', func=owner_filter))
@@ -839,7 +1020,8 @@ async def slot_cmd(e):
         res = "😅 Почти! Два одинаковых — ещё раз!"
     else:
         res = "💸 Не повезло. Попробуй снова!"
-    await msg.edit(f"🎰 [ {s[0]} | {s[1]} | {s[2]} ]\n\n{res}")
+    await msg.edit(ui.card("🎰 Слот-машина",
+                           f"[ {s[0]} | {s[1]} | {s[2]} ]\n\n{res}"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!lucky$', func=owner_filter))
@@ -856,7 +1038,8 @@ async def lucky_cmd(e):
         (0, 9): "💀 Сиди дома и не высовывайся!",
     }
     msg = next(v for (a, b), v in tips.items() if a <= pct <= b)
-    await respond(e, f"🔮 **Индекс удачи**\n\n[{bar}] **{pct}%**\n\n{msg}")
+    await respond(e, ui.card("🔮 Индекс удачи",
+                             f"[{bar}] **{pct}%**\n\n{msg}"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!choose (.+)', func=owner_filter))
@@ -865,11 +1048,13 @@ async def choose_cmd(e):
     raw = e.pattern_match.group(1)
     opts = [o.strip() for o in re.split(r'[,|/]', raw) if o.strip()]
     if len(opts) < 2:
-        await respond(e, "ℹ️ Перечисли варианты через запятую: `!choose пицца, суши, бургер`")
+        await respond(e, ui.usage("!choose пицца, суши, бургер",
+                                  title="Случайный выбор"))
         return
     winner = random.choice(opts)
     listed = "\n".join(f"{'➡️' if o == winner else '  •'} {o}" for o in opts)
-    await respond(e, f"🤔 **Выбираю из {len(opts)} вариантов...**\n\n{listed}\n\n✅ **Выбор: {winner}**")
+    await respond(e, ui.card(f"🤔 Выбираю из {len(opts)} вариантов",
+                             f"{listed}\n\n✅ **Выбор: {winner}**"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!quiz$', func=owner_filter))
@@ -889,9 +1074,10 @@ async def quiz_cmd(e):
     letters = ['A', 'B', 'C', 'D']
     opts_text = "\n".join(f"{letters[i]}. {o}" for i, o in enumerate(opts))
     correct = f"{letters[ans_idx]}. {opts[ans_idx]}"
-    await respond(e, 
-        f"🧠 **Вопрос:**\n_{q}_\n\n{opts_text}\n\n"
-        f"||✅ Ответ: **{correct}**||"
+    await respond(e,
+        ui.card("🧠 Викторина",
+                f"_{q}_\n\n{opts_text}\n\n"
+                f"||✅ Ответ: **{correct}**||")
     )
     db.bump_stat('cmds')
 
@@ -903,15 +1089,19 @@ async def calc_cmd(e):
     expr = e.pattern_match.group(1).strip()
     r = safe_eval(expr)
     if r is not None:
-        await respond(e, f"🧮 `{expr}` = **{r}**")
+        await respond(e, ui.card("🧮 Калькулятор",
+                                 ui.rows(("Выражение", f"`{expr}`"),
+                                         ("Результат", f"**{r}**"))))
     else:
-        await respond(e, "❌ Ошибка выражения. Разрешены: `+ - * / % sqrt sin cos tan log abs pow pi e factorial ceil floor round`")
+        await respond(e, ui.err("Проверь выражение.",
+                                title="Ошибка выражения",
+                                hint="Разрешены: `+ - * / % sqrt sin cos tan log abs pow pi e factorial ceil floor round`"))
     db.bump_stat('cmds')
 
 async def send_reminder(chat_id, msg_text, delay):
     await asyncio.sleep(delay)
     try:
-        await client.send_message(chat_id, f"⏰ **НАПОМИНАНИЕ:**\n{msg_text}")
+        await client.send_message(chat_id, ui.card("⏰ Напоминание", f"_{msg_text}"))
     except Exception as e:
         logger.error(f"Ошибка напоминания: {e}")
 
@@ -920,14 +1110,16 @@ async def remind_cmd(e):
 
     delay = int(e.pattern_match.group(1))
     text = e.pattern_match.group(2).strip()
-    await respond(e, f"⏰ Напоминание через **{fmt_time(delay)}**\n📝 _{text}_")
+    await respond(e, ui.card("⏰ Напоминание",
+                             ui.rows(("Через", f"**{fmt_time(delay)}**"),
+                                     ("Текст", f"_{text}_"))))
     asyncio.create_task(send_reminder(e.chat_id, text, delay))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!search (.+)', func=owner_filter))
 async def search_cmd(e):
     query = _to_english(e.pattern_match.group(1).strip())
-    msg = await respond(e, "⏳ Ищу...")
+    msg = await respond(e, ui.card("⏳ Wikipedia", "ищу…"))
     try:
         params = {
             'action': 'query',
@@ -941,7 +1133,8 @@ async def search_cmd(e):
                 data = await resp.json()
         results = data.get('query', {}).get('search', [])
         if not results:
-            await msg.edit("❌ Ничего не найдено.")
+            await msg.edit(ui.err("Ничего не найдено", title="Wikipedia",
+                                  hint="Попробуйте другой запрос"))
             return
         lines = [f"🔍 **Результаты (Wikipedia):** _{query}_\n"]
         for i, r in enumerate(results, 1):
@@ -951,16 +1144,16 @@ async def search_cmd(e):
             lines.append(f"{i}. [{title}]({href})")
             if snippet:
                 lines.append(f"   _{snippet}_")
-        await msg.edit("\n".join(lines))
+        await msg.edit(ui.card(f"🔍 Wikipedia: {query}", "\n".join(lines[1:]) or "—"))
     except Exception as ex:
-        await msg.edit(f"❌ Ошибка поиска: {ex}")
+        await msg.edit(ui.err(f"Ошибка поиска: {ex}", title="Wikipedia"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!shorten (.+)', func=owner_filter))
 async def shorten_cmd(e):
 
     url = e.pattern_match.group(1).strip()
-    msg = await respond(e, "⏳ Сокращаю...")
+    msg = await respond(e, ui.card("⏳ Сокращение", "сокращаю ссылку…"))
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get("https://is.gd/create.php",
@@ -968,18 +1161,20 @@ async def shorten_cmd(e):
                              timeout=aiohttp.ClientTimeout(total=10)) as r:
                 data = await r.json()
         if 'shorturl' in data:
-            await msg.edit(f"✂️ **Оригинал:** `{url[:55]}{'…' if len(url) > 55 else ''}`\n🔗 **Короткая:** {data['shorturl']}")
+            await msg.edit(ui.card("✂️ Ссылка сокращена",
+                                   ui.rows(("Оригинал", f"`{url[:55]}{'…' if len(url) > 55 else ''}`"),
+                                           ("Короткая", data['shorturl']))))
         else:
-            await msg.edit(f"❌ Ошибка: {data.get('errormessage', 'Неверный URL')}")
+            await msg.edit(ui.err(data.get('errormessage', 'Неверный URL'), title="Сокращение ссылки"))
     except Exception:
-        await msg.edit("❌ Ошибка. Проверь URL.")
+        await msg.edit(ui.err("Проверь URL.", title="Сокращение ссылки"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!weather (.+)', func=owner_filter))
 async def weather_cmd(e):
 
     city = e.pattern_match.group(1).strip()
-    msg = await respond(e, "⏳ Запрашиваю погоду...")
+    msg = await respond(e, ui.card("⏳ Погода", "запрашиваю данные…"))
     try:
         city_en = _to_english(city)
         from urllib.parse import quote
@@ -992,7 +1187,8 @@ async def weather_cmd(e):
         cc = data.get('current_condition')
         loc = data.get('nearest_area')
         if not cc or not loc:
-            await msg.edit("❌ Город не найден. Попробуй на латинице или уточни (страна/регион).")
+            await msg.edit(ui.err("Город не найден. Попробуй на латинице или уточни (страна/регион).",
+                                  title="Погода"))
             return
         cc = cc[0]
         loc = loc[0]
@@ -1004,11 +1200,11 @@ async def weather_cmd(e):
         wind = cc['windspeedKmph']
         desc = cc['weatherDesc'][0]['value']
         await msg.edit(
-            f"🌤 **Погода: {city_name}, {country}**\n\n"
-            f"🌡 Температура: **{temp}°C** (ощущается как {feels}°C)\n"
-            f"💧 Влажность: **{humidity}%**\n"
-            f"💨 Ветер: **{wind} км/ч**\n"
-            f"📋 {desc}"
+            ui.card(f"🌤 Погода: {city_name}, {country}",
+                    ui.rows(("Температура", f"**{temp}°C** (ощущается как {feels}°C)", "🌡"),
+                            ("Влажность", f"**{humidity}%**", "💧"),
+                            ("Ветер", f"**{wind} км/ч**", "💨"),
+                            ("Описание", desc, "📋")))
         )
     except (aiohttp.ClientError, ConnectionError) as ex:
         logger.warning(f"wttr.in failed: {ex}, trying Open-Meteo...")
@@ -1018,12 +1214,12 @@ async def weather_cmd(e):
                 timeout=aiohttp.ClientTimeout(total=10)
             )
             if geo_r.status != 200:
-                await msg.edit("❌ Город не найден. Попробуй на латинице.")
+                await msg.edit(ui.err("Город не найден. Попробуй на латинице.", title="Погода"))
                 return
             geo = await geo_r.json()
             results = geo.get('results')
             if not results:
-                await msg.edit("❌ Город не найден. Попробуй на латинице.")
+                await msg.edit(ui.err("Город не найден. Попробуй на латинице.", title="Погода"))
                 return
             lat = results[0]['latitude']
             lon = results[0]['longitude']
@@ -1036,7 +1232,7 @@ async def weather_cmd(e):
                 timeout=aiohttp.ClientTimeout(total=10)
             )
             if weather_r.status != 200:
-                await msg.edit("❌ Не удалось получить погоду. Попробуй позже.")
+                await msg.edit(ui.err("Не удалось получить погоду. Попробуй позже.", title="Погода"))
                 return
             wdata = await weather_r.json()
             cur = wdata.get('current', {})
@@ -1051,15 +1247,15 @@ async def weather_cmd(e):
                      80:'Ливень', 81:'Ливень', 82:'Ливень', 95:'Гроза', 96:'Гроза', 99:'Гроза'}
             desc = descs.get(wcode, f'Код {wcode}')
             await msg.edit(
-                f"🌤 **Погода: {city_name}, {country}**\n\n"
-                f"🌡 Температура: **{temp}°C** (ощущается как {feels}°C)\n"
-                f"💧 Влажность: **{humidity}%**\n"
-                f"💨 Ветер: **{wind} км/ч**\n"
-                f"📋 {desc}"
+                ui.card(f"🌤 Погода: {city_name}, {country}",
+                        ui.rows(("Температура", f"**{temp}°C** (ощущается как {feels}°C)", "🌡"),
+                                ("Влажность", f"**{humidity}%**", "💧"),
+                                ("Ветер", f"**{wind} км/ч**", "💨"),
+                                ("Описание", desc, "📋")))
             )
     except Exception as ex:
         logger.warning(f"Weather error: {ex}", exc_info=True)
-        await msg.edit("❌ Ошибка получения погоды. Попробуй позже.")
+        await msg.edit(ui.err("Ошибка получения погоды. Попробуй позже.", title="Погода"))
     db.bump_stat('cmds')
 
 def _to_english(text):
@@ -1076,13 +1272,13 @@ async def translate_cmd(e):
 
     target_lang = e.pattern_match.group(1) or 'ru'
     text = e.pattern_match.group(2).strip()
-    msg = await respond(e, "⏳ Перевожу...")
+    msg = await respond(e, ui.card("⏳ Переводчик", "перевожу…"))
     try:
         t = await asyncio.to_thread(_get_translator, target_lang)
         result = await asyncio.to_thread(t.translate, text)
-        await msg.edit(f"🌐 **Перевод ({target_lang}):**\n\n{result}")
+        await msg.edit(ui.card(f"🌐 Перевод ({target_lang})", f"{result}"))
     except Exception as ex:
-        await msg.edit(f"❌ Ошибка перевода: {ex}")
+        await msg.edit(ui.err(f"Ошибка перевода: {ex}", title="Переводчик"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!base64 (encode|decode) (.+)', func=owner_filter))
@@ -1092,33 +1288,37 @@ async def base64_cmd(e):
     try:
         if mode == 'encode':
             res = base64.b64encode(text.encode()).decode()
-            await respond(e, f"🔐 **Base64 encode:**\n`{res}`")
+            await respond(e, ui.card("🔐 Base64 encode", f"`{res}`"))
         else:
             res = base64.b64decode(text.encode()).decode()
-            await respond(e, f"🔓 **Base64 decode:**\n`{res}`")
+            await respond(e, ui.card("🔓 Base64 decode", f"`{res}`"))
     except Exception as ex:
         logger.error(f"base64 error: {ex}")
-        await respond(e, "❌ Ошибка. Проверь данные.")
+        await respond(e, ui.err("Проверь данные.", title="Base64"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!hash (.+)', func=owner_filter))
 async def hash_cmd(e):
 
     text = e.pattern_match.group(1).strip().encode()
-    await respond(e, 
-        f"#️⃣ **Хэши**\n\n"
-        f"MD5:    `{hashlib.md5(text).hexdigest()}`\n"
-        f"SHA1:   `{hashlib.sha1(text).hexdigest()}`\n"
-        f"SHA256: `{hashlib.sha256(text).hexdigest()}`\n"
-        f"SHA512: `{hashlib.sha512(text).hexdigest()[:64]}…`"
-    )
+    await respond(e, ui.card(
+        "#️⃣ Хэши",
+        ui.rows(
+            ("MD5", f"`{hashlib.md5(text).hexdigest()}`"),
+            ("SHA1", f"`{hashlib.sha1(text).hexdigest()}`"),
+            ("SHA256", f"`{hashlib.sha256(text).hexdigest()}`"),
+            ("SHA512", f"`{hashlib.sha512(text).hexdigest()[:64]}…`"),
+        ),
+    ))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!morse (.+)', func=owner_filter))
 async def morse_cmd(e):
 
     text = e.pattern_match.group(1).strip()
-    await respond(e, f"📡 **Морзе:**\n_{text}_\n\n`{morse_enc(text)}`")
+    await respond(e, ui.card("📡 Азбука Морзе",
+                             ui.rows(("Текст", f"_{text}_"),
+                                     ("Код", f"`{morse_enc(text)}`"))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!caesar (encode|decode) (\d+) (.+)', func=owner_filter))
@@ -1126,7 +1326,9 @@ async def caesar_cmd(e):
 
     mode, shift, text = e.pattern_match.group(1), int(e.pattern_match.group(2)), e.pattern_match.group(3)
     res = caesar(text, shift, dec=(mode == 'decode'))
-    await respond(e, f"{'🔒' if mode == 'encode' else '🔓'} **Цезарь (сдвиг {shift}):**\n_{text}_\n\n`{res}`")
+    await respond(e, ui.card(f"{'🔒' if mode == 'encode' else '🔓'} Цезарь (сдвиг {shift})",
+                             ui.rows(("Текст", f"_{text}_"),
+                                     ("Результат", f"`{res}`"))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!vigenere (encode|decode) (\S+) (.+)', func=owner_filter))
@@ -1134,7 +1336,9 @@ async def vigenere_cmd(e):
 
     mode, key, text = e.pattern_match.group(1), e.pattern_match.group(2), e.pattern_match.group(3)
     res = vigenere(text, key, dec=(mode == 'decode'))
-    await respond(e, f"{'🔒' if mode == 'encode' else '🔓'} **Виженер (ключ: {key}):**\n_{text}_\n\n`{res}`")
+    await respond(e, ui.card(f"{'🔒' if mode == 'encode' else '🔓'} Виженер (ключ {key})",
+                             ui.rows(("Текст", f"_{text}_"),
+                                     ("Результат", f"`{res}`"))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!password(?:\s+(\d+))?(?:\s+(simple))?$', func=owner_filter))
@@ -1144,25 +1348,28 @@ async def password_cmd(e):
     sym = not e.pattern_match.group(2)
     pwd = gen_pwd(length, sym)
     s = "🔴 Слабый" if length < 8 else "🟡 Средний" if length < 12 else "🟢 Сильный" if length < 20 else "💎 Очень сильный"
-    await respond(e, f"🔑 **Пароль ({length} симв.)**\n\n`{pwd}`\n\nСила: {s}\nСимволы: {'✅' if sym else '❌'}")
+    await respond(e, ui.card(f"🔑 Пароль ({length} симв.)",
+                             f"`{pwd}`\n\n"
+                             + ui.rows(("Сила", s),
+                                       ("Символы", '✅' if sym else '❌'))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!qr (.+)', func=owner_filter))
 async def qr_cmd(e):
 
     text = e.pattern_match.group(1).strip()
-    msg = await respond(e, "⏳ Генерирую QR-код...")
+    msg = await respond(e, ui.card("⏳ QR-код", "генерирую…"))
     try:
         os.makedirs(MEDIA_DIR, exist_ok=True)
         path = os.path.join(MEDIA_DIR, f'qr_{int(time.time())}.png')
         img = await asyncio.to_thread(qrcode.make, text)
         await asyncio.to_thread(img.save, path)
         await client.send_file(e.chat_id, path,
-            caption=f"📱 QR-код для:\n`{text[:80]}{'...' if len(text) > 80 else ''}`")
+            caption=ui.card("📱 QR-код", f"`{text[:80]}{'...' if len(text) > 80 else ''}`"))
         await msg.delete()
         os.remove(path)
     except Exception as ex:
-        await msg.edit(f"❌ Ошибка: {ex}")
+        await msg.edit(ui.err(f"{ex}", title="QR-код"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!uuid$', func=owner_filter))
@@ -1170,7 +1377,7 @@ async def uuid_cmd(e):
 
     ids = [str(uuid.uuid4()) for _ in range(5)]
     out = "\n".join(f"`{u}`" for u in ids)
-    await respond(e, f"🆔 **Случайные UUID v4:**\n\n{out}")
+    await respond(e, ui.card("🆔 UUID v4", out))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!color (.+)', func=owner_filter))
@@ -1185,7 +1392,7 @@ async def color_cmd(e):
         raw = raw.removeprefix('rgb(').removesuffix(')')
         r, g, b = map(int, raw.split(','))
         hex_val = f"#{r:02X}{g:02X}{b:02X}"
-    msg = await respond(e, "⏳ Генерирую образец цвета...")
+    msg = await respond(e, ui.card("⏳ Цвет", "генерирую образец…"))
     try:
         os.makedirs(MEDIA_DIR, exist_ok=True)
         path = os.path.join(MEDIA_DIR, f'color_{int(time.time())}.png')
@@ -1196,11 +1403,11 @@ async def color_cmd(e):
         await asyncio.to_thread(draw.text, (10, 10), hex_val, fill=text_color)
         await asyncio.to_thread(img.save, path)
         await client.send_file(e.chat_id, path,
-            caption=f"🎨 **{hex_val}**\nRGB: `rgb({r}, {g}, {b})`")
+            caption=ui.card(f"🎨 {hex_val}", ui.rows(("RGB", f"`rgb({r}, {g}, {b})`"))))
         await msg.delete()
         os.remove(path)
     except Exception as ex:
-        await msg.edit(f"❌ Ошибка: {ex}")
+        await msg.edit(ui.err(f"{ex}", title="Цвет"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!ascii (.+)', func=owner_filter))
@@ -1209,7 +1416,10 @@ async def ascii_cmd(e):
     text = e.pattern_match.group(1).strip()
     codes = ' '.join(str(ord(c)) for c in text)
     back = ''.join(chr(int(x)) for x in codes.split())
-    await respond(e, f"🔢 **ASCII коды:**\n_{text}_\n\n`{codes}`\n\nОбратно: `{back}`")
+    await respond(e, ui.card("🔢 ASCII коды",
+                             ui.rows(("Текст", f"_{text}_"),
+                                     ("Коды", f"`{codes}`"),
+                                     ("Обратно", f"`{back}`"))))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!type(?:\s+(fast|slow|matrix|glitch))?\s+(.+)', func=owner_filter))
@@ -1305,7 +1515,7 @@ async def clean_cmd(e):
             await msg.delete()
             count += 1
             await asyncio.sleep(0.1)
-    info = await client.send_message(e.chat_id, f"✅ Удалено **{count}** своих сообщений")
+    info = await client.send_message(e.chat_id, ui.ok(f"Удалено **{count}** своих сообщений"))
     await asyncio.sleep(3)
     await info.delete()
     db.bump_stat('cmds')
@@ -1320,7 +1530,7 @@ async def purge_cmd(e):
         await msg.delete()
         count += 1
         await asyncio.sleep(0.04)
-    info = await client.send_message(e.chat_id, f"⚠️ Удалено **{count}** сообщений")
+    info = await client.send_message(e.chat_id, ui.warn(f"Удалено **{count}** сообщений", title="Очистка"))
     await asyncio.sleep(3)
     await info.delete()
     db.bump_stat('cmds')
@@ -1331,12 +1541,13 @@ async def spam_cmd(e):
     count, text = int(e.pattern_match.group(1)), e.pattern_match.group(2).strip()
     MAX_SPAM = 50
     if count < 1 or count > MAX_SPAM:
-        await respond(e, f"❌ Допустимо от 1 до {MAX_SPAM} сообщений.")
+        await respond(e, ui.err(f"Допустимо от 1 до {MAX_SPAM} сообщений.", title="Спам"))
         return
     cooldown_key = f'spam_{e.chat_id}'
     remaining = command_cooldown.get(cooldown_key, 0) - time.time()
     if remaining > 0:
-        await respond(e, f"⏳ Подождите {int(remaining)} сек перед повторным спамом.")
+        await respond(e, ui.err(f"Подождите {int(remaining)} сек перед повторным спамом.",
+                                title="Кулдаун"))
         return
     command_cooldown[cooldown_key] = time.time() + 30
     await e.delete()
@@ -1349,21 +1560,21 @@ async def spam_cmd(e):
 async def forward_cmd(e):
 
     if not e.reply_to_msg_id:
-        await respond(e, "ℹ️ Ответьте на сообщение: `!forward [chat_id]`")
+        await respond(e, ui.usage("!forward <chat_id>", title="Пересылка"))
         return
     try:
         msg = await e.get_reply_message()
         await client.forward_messages(int(e.pattern_match.group(1)), msg)
-        await respond(e, f"✅ Переслано в `{e.pattern_match.group(1)}`")
+        await respond(e, ui.ok(ui.kv("Чат", f"`{e.pattern_match.group(1)}`"), title="Переслано"))
     except Exception as ex:
-        await respond(e, f"❌ {ex}")
+        await respond(e, ui.err(f"{ex}", title="Пересылка"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!pin$', func=owner_filter))
 async def pin_cmd(e):
 
     if not e.reply_to_msg_id:
-        await respond(e, "ℹ️ Ответьте на сообщение")
+        await respond(e, ui.usage("!pin", title="Закреп"))
         return
     await (await e.get_reply_message()).pin(notify=False)
     await e.delete()
@@ -1383,7 +1594,7 @@ async def unpin_cmd(e):
 async def copyall_cmd(e):
 
     count, target = int(e.pattern_match.group(1)), int(e.pattern_match.group(2))
-    await respond(e, f"⏳ Копирую {count} сообщений...")
+    await respond(e, ui.card("⏳ Копирование", ui.rows(("Сообщений", f"`{count}`"))))
     msgs = []
     async for m in client.iter_messages(e.chat_id, limit=count):
         msgs.append(m)
@@ -1396,14 +1607,15 @@ async def copyall_cmd(e):
             await asyncio.sleep(0.4)
         except Exception:
             pass
-    await respond(e, f"✅ Скопировано **{copied}/{count}** → `{target}`")
+    await respond(e, ui.ok(ui.rows(("Скопировано", f"**{copied}/{count}**"),
+                                   ("Чат", f"`{target}`")), title="Копирование завершено"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!react (.+)', func=owner_filter))
 async def react_cmd(e):
 
     if not e.reply_to_msg_id:
-        await respond(e, "ℹ️ Ответьте на сообщение: `!react 👍`")
+        await respond(e, ui.usage("!react 👍", title="Реакция"))
         return
     emoji = e.pattern_match.group(1).strip()
     try:
@@ -1414,28 +1626,28 @@ async def react_cmd(e):
         ))
         await e.delete()
     except Exception as ex:
-        await respond(e, f"❌ Не удалось поставить реакцию: {ex}")
+        await respond(e, ui.err(f"Не удалось поставить реакцию: {ex}", title="Реакция"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'^!save$', func=owner_filter))
 async def save_media_cmd(e):
 
     if not e.reply_to_msg_id:
-        await respond(e, "ℹ️ Ответьте на фото/видео или используйте `!save key value`")
+        await respond(e, ui.usage("!save", "!save <ключ> <значение>", title="Сохранение"))
         return
     replied = await e.get_reply_message()
     if not replied.media:
-        await respond(e, "❌ В ответном сообщении нет медиа.")
+        await respond(e, ui.err("В ответном сообщении нет медиа.", title="Сохранение"))
         return
     os.makedirs(MEDIA_DIR, exist_ok=True)
     try:
         path = await replied.download_media(os.path.join(MEDIA_DIR, ''))
         name = os.path.basename(path) if path else 'unknown'
         db.set_saved(f'_media_{int(time.time())}', name)
-        await respond(e, f"✅ **Сохранено:** `{name}`")
+        await respond(e, ui.ok(ui.kv("Файл", f"`{name}`"), title="Медиа сохранено"))
         logger.info(f"Media saved: {name}")
     except Exception as ex:
-        await respond(e, f"❌ Ошибка сохранения: {ex}")
+        await respond(e, ui.err(f"Ошибка сохранения: {ex}", title="Сохранение"))
         logger.error(f"Save media error: {ex}")
     db.bump_stat('cmds')
 
@@ -1444,7 +1656,7 @@ async def save_cmd(e):
 
     k, v = e.pattern_match.group(1), e.pattern_match.group(2)
     db.set_saved(k, v)
-    await respond(e, f"✅ `{k}` = _{v}_")
+    await respond(e, ui.ok(ui.kv(k, f"_{v}_"), title="Сохранено"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!get (\S+)', func=owner_filter))
@@ -1452,7 +1664,9 @@ async def get_cmd(e):
 
     k = e.pattern_match.group(1)
     v = db.get_saved(k)
-    await respond(e, f"📦 `{k}` = _{v}_" if v else f"❌ Ключ `{k}` не найден")
+    await respond(e, ui.card("📦 Данные", ui.kv(k, f"_{v}_")) if v
+                   else ui.err(f"Ключ `{k}` не найден", title="Данные",
+                               hint="`!list` — все ключи"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!del (\S+)', func=owner_filter))
@@ -1462,9 +1676,9 @@ async def del_cmd(e):
     v = db.get_saved(k)
     if v is not None:
         db.del_saved(k)
-        await respond(e, f"🗑 Удалено: `{k}`")
+        await respond(e, ui.ok(ui.kv("Ключ", f"`{k}`"), title="Удалено"))
     else:
-        await respond(e, f"❌ `{k}` не найден")
+        await respond(e, ui.err(f"Ключ `{k}` не найден", title="Данные"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!list$', func=owner_filter))
@@ -1472,11 +1686,12 @@ async def list_cmd(e):
 
     d = db.all_saved()
     if not d:
-        await respond(e, "📭 Нет данных")
+        await respond(e, ui.card("📭 Данные", "список пуст",
+                                 hint="`!save <ключ> <значение>` — сохранить"))
         db.bump_stat('cmds')
         return
     items = "\n".join(f"• `{k}` — _{v[:40]}{'…' if len(v) > 40 else ''}_" for k, v in d.items())
-    await respond(e, f"📦 **Сохранено ({len(d)}):**\n\n{items}")
+    await respond(e, ui.card(f"📦 Сохранено ({len(d)})", items))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!find (.+)', func=owner_filter))
@@ -1495,9 +1710,10 @@ async def find_cmd(e):
         for row in notes_results:
             lines.append(f"  • `{row['key']}` — _{row['value'][:40]}{'…' if len(row['value']) > 40 else ''}_")
     if not lines:
-        await respond(e, "🔍 **Ничего не найдено**")
+        await respond(e, ui.card("🔍 Поиск", f"по запросу `{query}` ничего не найдено",
+                                 hint="`!list` и `!notes` — все данные"))
     else:
-        await respond(e, f"🔍 **Результаты поиска: {query}**\n\n" + "\n".join(lines))
+        await respond(e, ui.card(f"🔍 Результаты: {query}", "\n".join(lines)))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!note (\S+)(?: (.+))?', func=owner_filter))
@@ -1509,10 +1725,10 @@ async def note_cmd(e):
         r = await e.get_reply_message()
         t = r.text or t
     if not t:
-        await respond(e, "ℹ️ `!note <название> <текст>` или ответом")
+        await respond(e, ui.usage("!note <название> <текст>", title="Заметка"))
         return
     db.set_note(k, t)
-    await respond(e, f"📝 Заметка сохранена: `{k}`")
+    await respond(e, ui.ok(ui.kv("Название", f"`{k}`"), title="Заметка сохранена"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!getnote (\S+)', func=owner_filter))
@@ -1521,9 +1737,10 @@ async def getnote_cmd(e):
     k = e.pattern_match.group(1)
     v = db.get_note(k)
     if v is not None:
-        await respond(e, f"📝 **{k}:**\n\n{v}")
+        await respond(e, ui.card(f"📝 {k}", v))
     else:
-        await respond(e, f"❌ Заметка `{k}` не найдена")
+        await respond(e, ui.err(f"Заметка `{k}` не найдена", title="Заметки",
+                                hint="`!notes` — список всех"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!delnote (\S+)', func=owner_filter))
@@ -1533,9 +1750,9 @@ async def delnote_cmd(e):
     v = db.get_note(k)
     if v is not None:
         db.del_note(k)
-        await respond(e, f"🗑 Заметка удалена: `{k}`")
+        await respond(e, ui.ok(ui.kv("Название", f"`{k}`"), title="Заметка удалена"))
     else:
-        await respond(e, f"❌ `{k}` не найдена")
+        await respond(e, ui.err(f"Заметка `{k}` не найдена", title="Заметки"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!notes$', func=owner_filter))
@@ -1543,11 +1760,12 @@ async def notes_cmd(e):
 
     d = db.all_notes()
     if not d:
-        await respond(e, "📭 Нет заметок")
+        await respond(e, ui.card("📭 Заметки", "список пуст",
+                                 hint="`!note <название> <текст>` — добавить"))
         db.bump_stat('cmds')
         return
     items = "\n".join(f"• `{k}` — _{v[:40]}{'…' if len(v) > 40 else ''}_" for k, v in d.items())
-    await respond(e, f"📝 **Заметки ({len(d)}):**\n\n{items}")
+    await respond(e, ui.card(f"📝 Заметки ({len(d)})", items))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!todo (.+)', func=owner_filter))
@@ -1556,7 +1774,8 @@ async def todo_add_cmd(e):
     task = e.pattern_match.group(1).strip()
     db.add_todo(task)
     todos = db.get_todos()
-    await respond(e, f"✅ Задача добавлена: _{task}_\n📋 Всего: {len(todos)}")
+    await respond(e, ui.ok(ui.kv("Задача", f"_{task}_"), title="Задача добавлена")
+                   + f"\n{ui.SEP}\n📋 Всего: **{len(todos)}**")
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!todos$', func=owner_filter))
@@ -1564,7 +1783,8 @@ async def todos_cmd(e):
 
     todos = db.get_todos()
     if not todos:
-        await respond(e, "📭 Список задач пуст")
+        await respond(e, ui.card("📋 Задачи", "список пуст",
+                                 hint="`!todo <текст>` — добавить задачу"))
         db.bump_stat('cmds')
         return
     lines = []
@@ -1572,7 +1792,8 @@ async def todos_cmd(e):
         mark = "✅" if t['done'] else "⬜"
         lines.append(f"{mark} {i}. _{t['text']}_")
     done = sum(1 for t in todos if t['done'])
-    await respond(e, f"📋 **Список задач** ({done}/{len(todos)} выполнено):\n\n" + "\n".join(lines))
+    await respond(e, ui.card(f"📋 Задачи ({done}/{len(todos)} выполнено)", "\n".join(lines),
+                             hint="`!done <№>` — выполнено · `!undone <№>` — вернуть"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!done (\d+)', func=owner_filter))
@@ -1582,9 +1803,10 @@ async def done_cmd(e):
     todos = db.get_todos()
     if 0 <= idx < len(todos):
         db.update_todo(todos[idx]['id'], done=True)
-        await respond(e, f"✅ Выполнено: _{todos[idx]['text']}_")
+        await respond(e, ui.ok(ui.kv("Задача", f"_{todos[idx]['text']}_"), title="Выполнено"))
     else:
-        await respond(e, f"❌ Задача #{idx + 1} не найдена")
+        await respond(e, ui.err(f"Задача #{idx + 1} не найдена", title="Задачи",
+                                hint="`!todos` — список задач"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!undone (\d+)', func=owner_filter))
@@ -1594,9 +1816,10 @@ async def undone_cmd(e):
     todos = db.get_todos()
     if 0 <= idx < len(todos):
         db.update_todo(todos[idx]['id'], done=False)
-        await respond(e, f"⬜ Снята отметка: _{todos[idx]['text']}_")
+        await respond(e, ui.ok(ui.kv("Задача", f"_{todos[idx]['text']}_"), title="Отметка снята"))
     else:
-        await respond(e, f"❌ Задача #{idx + 1} не найдена")
+        await respond(e, ui.err(f"Задача #{idx + 1} не найдена", title="Задачи",
+                                hint="`!todos` — список задач"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!deltodo (\d+)', func=owner_filter))
@@ -1606,9 +1829,10 @@ async def deltodo_cmd(e):
     todos = db.get_todos()
     if 0 <= idx < len(todos):
         db.del_todo(todos[idx]['id'])
-        await respond(e, f"🗑 Удалена задача: _{todos[idx]['text']}_")
+        await respond(e, ui.ok(ui.kv("Задача", f"_{todos[idx]['text']}_"), title="Задача удалена"))
     else:
-        await respond(e, f"❌ Задача #{idx + 1} не найдена")
+        await respond(e, ui.err(f"Задача #{idx + 1} не найдена", title="Задачи",
+                                hint="`!todos` — список задач"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!afk(?:\s+(.+))?$', func=owner_filter))
@@ -1616,8 +1840,9 @@ async def afk_cmd(e):
 
     reason = (e.pattern_match.group(1) or '').strip()
     state.set_afk(reason)
-    r = f"\n📝 _{reason}_" if reason else ""
-    await respond(e, f"😴 **AFK включён**{r}")
+    r = ui.kv("Причина", f"_{reason}_", "📝") if reason else ui.kv("Причина", "не указана", "📝")
+    await respond(e, ui.card("😴 AFK включён", r,
+                             hint="`!unafk` — выключить"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!unafk$', func=owner_filter))
@@ -1625,9 +1850,10 @@ async def unafk_cmd(e):
 
     dur = state.clear_afk()
     if dur is not None:
-        await respond(e, f"☀️ **AFK выключен** | Отсутствовал: _{fmt_time(dur)}_")
+        await respond(e, ui.card("☀️ AFK выключен",
+                                 ui.rows(("Отсутствовал", f"_{fmt_time(dur)}_"))))
     else:
-        await respond(e, "ℹ️ AFK не был включён")
+        await respond(e, ui.info("AFK не был включён", title="AFK"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!chatinfo$', func=owner_filter))
@@ -1638,18 +1864,14 @@ async def chatinfo_cmd(e):
     uname = getattr(chat, 'username', None)
     members = getattr(chat, 'participants_count', None)
     lines = [
-        f"📊 **Информация о чате**\n",
-        f"📛 **{name}**",
-        f"🆔 `{e.chat_id}`",
+        ui.kv("Название", f"**{name}**", "📛"),
+        ui.kv("ID", f"`{e.chat_id}`", "🆔"),
+        ui.kv("Username", f"@{uname}" if uname else "нет", "🔖"),
+        ui.kv("Тип", f"`{type(chat).__name__}`", "👥"),
     ]
-    if uname:
-        lines.append(f"🔖 @{uname}")
-    else:
-        lines.append("🔖 Username: нет")
-    lines.append(f"👥 Тип: `{type(chat).__name__}`")
     if members:
-        lines.append(f"👤 Участников: `{members}`")
-    await respond(e, "\n".join(lines))
+        lines.append(ui.kv("Участников", f"`{members}`", "👤"))
+    await respond(e, ui.card("📊 Чат", "\n".join(lines)))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!members$', func=owner_filter))
@@ -1658,9 +1880,12 @@ async def members_cmd(e):
     try:
         p = await client.get_participants(e.chat_id)
         bots = sum(1 for x in p if x.bot)
-        await respond(e, f"👥 **Участники**\n\nВсего: `{len(p)}`\n👤 Людей: `{len(p) - bots}`\n🤖 Ботов: `{bots}`")
+        await respond(e, ui.card("👥 Участники",
+                                 ui.rows(("Всего", f"`{len(p)}`"),
+                                         ("Людей", f"`{len(p) - bots}`", "👤"),
+                                         ("Ботов", f"`{bots}`", "🤖"))))
     except Exception as ex:
-        await respond(e, f"❌ {ex}")
+        await respond(e, ui.err(f"{ex}", title="Участники"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!admins$', func=owner_filter))
@@ -1668,20 +1893,20 @@ async def admins_cmd(e):
 
     try:
         admins = await client.get_participants(e.chat_id, filter=ChannelParticipantsAdmins())
-        lines = [f"👑 **Администраторы ({len(admins)}):**\n"]
+        lines = []
         for a in admins[:25]:
             name = f"{a.first_name or ''} {a.last_name or ''}".strip()
             lines.append(f"• {name} — {'@' + a.username if a.username else '`' + str(a.id) + '`'}")
-        await respond(e, "\n".join(lines))
+        await respond(e, ui.card(f"👑 Администраторы ({len(admins)})", "\n".join(lines) or "—"))
     except Exception as ex:
-        await respond(e, f"❌ {ex}")
+        await respond(e, ui.err(f"{ex}", title="Администраторы"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!top(?:\s+(\d+))?$', func=owner_filter))
 async def top_cmd(e):
 
     limit = int(e.pattern_match.group(1) or 200)
-    await respond(e, "⏳ Анализирую...")
+    await respond(e, ui.card("⏳ Топ активных", "анализирую сообщения…"))
     cnt, names = defaultdict(int), {}
     async for msg in client.iter_messages(e.chat_id, limit=limit):
         if msg.sender_id:
@@ -1693,10 +1918,11 @@ async def top_cmd(e):
                     names[msg.sender_id] = n or str(msg.sender_id)
     top = sorted(cnt.items(), key=lambda x: x[1], reverse=True)[:10]
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
-    lines = [f"🏆 **Топ активных** (из {limit} сообщ.):\n"]
+    lines = [f"🏆 **Топ активных** (из {limit} сообщ.)\n"]
     for i, (uid, c) in enumerate(top):
         lines.append(f"{medals[i]} {names.get(uid, uid)} — `{c}` сообщ.")
-    await respond(e, "\n".join(lines))
+    await respond(e, ui.card("🏆 Топ активных",
+                             f"из `{limit}` сообщ.\n\n" + "\n".join(lines[1:])))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!bots$', func=owner_filter))
@@ -1704,12 +1930,12 @@ async def bots_cmd(e):
 
     try:
         bots = await client.get_participants(e.chat_id, filter=ChannelParticipantsBots())
-        lines = [f"🤖 **Боты в чате ({len(bots)}):**\n"]
+        lines = []
         for b in bots[:20]:
             lines.append(f"• @{b.username or b.id}")
-        await respond(e, "\n".join(lines))
+        await respond(e, ui.card(f"🤖 Боты в чате ({len(bots)})", "\n".join(lines) or "—"))
     except Exception as ex:
-        await respond(e, f"❌ {ex}")
+        await respond(e, ui.err(f"{ex}", title="Боты"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!resetdata$', func=owner_filter))
@@ -1723,7 +1949,8 @@ async def resetdata_cmd(e):
     state.afk_reason = ''
     state.sudo_users.clear()
     state._save()
-    await respond(e, "🧹 **Все данные сброшены.**")
+    await respond(e, ui.warn("База, автоответчик, AFK и sudo очищены.",
+                             title="Данные сброшены"))
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!ytshow\s+(.+)', func=owner_filter))
@@ -1738,7 +1965,8 @@ async def ytshow_cmd(e):
         url = raw
         height = None
 
-    status_msg = await respond(e, f"⏳ Загружаю ({'авто' if not height else f'{height}p'})...")
+    status_msg = await respond(e, ui.card("⏳ Загрузка",
+                                          ui.rows(("Качество", f"{'авто' if not height else f'{height}p'}"))))
 
     async def edit_fn(text):
         try:
@@ -1756,7 +1984,7 @@ async def dl_cmd(e):
 
     url = e.pattern_match.group(1).strip()
 
-    status_msg = await respond(e, "⏳ Загрузка...")
+    status_msg = await respond(e, ui.card("⏳ Загрузка", "запрос отправлен…"))
 
     async def edit_fn(text):
         try:
@@ -1770,7 +1998,7 @@ async def dl_cmd(e):
             await send_and_clean(edit_fn, client, e.chat_id, filename)
     except Exception as ex:
         try:
-            await status_msg.edit(f"❌ Ошибка: {ex}")
+            await status_msg.edit(ui.err(f"{ex}", title="Загрузка"))
         except Exception:
             pass
         _log.error(f"dl error: {ex}")
@@ -1788,7 +2016,7 @@ async def playlist_cmd(e):
         start_num = int(g.group(2))
         end_num = int(g.group(3)) if g.group(3) else start_num
 
-    msg = await respond(e, "⏳ Получаю информацию о плейлисте...")
+    msg = await respond(e, ui.card("⏳ Плейлист", "получаю информацию…"))
     try:
         import yt_dlp
 
@@ -1820,7 +2048,7 @@ async def playlist_cmd(e):
         title, video_urls = await asyncio.to_thread(_get_playlist_info)
 
         if not video_urls:
-            await msg.edit("❌ Плейлист пуст или недоступен.")
+            await msg.edit(ui.err("Плейлист пуст или недоступен.", title="Плейлист"))
             return
 
         total = len(video_urls)
@@ -1831,10 +2059,14 @@ async def playlist_cmd(e):
         else:
             selected = video_urls[:50]
 
-        await msg.edit(f"📋 Плейлист: **{title or '?'}** ({len(selected)}/{total} видео)\n⏳ Начинаю загрузку...")
+        await msg.edit(ui.card("📋 Плейлист",
+                               ui.rows(("Название", f"**{title or '?'}**"),
+                                       ("Видео", f"`{len(selected)}/{total}`")),
+                               footer="⏳ Начинаю загрузку…"))
 
         for i, video_url in enumerate(selected, 1):
-            vid_msg = await respond(e, f"⏳ [{i}/{len(selected)}] Загружаю видео {i}...")
+            vid_msg = await respond(e, ui.card("⏳ Загрузка видео",
+                                               ui.rows(("Позиция", f"`{i}/{len(selected)}`"))))
 
             async def edit_vid(text, vm=vid_msg):
                 try:
@@ -1847,9 +2079,10 @@ async def playlist_cmd(e):
                 await send_and_clean(edit_vid, client, e.chat_id, filename, f"🎬 [{i}/{len(selected)}]")
                 await asyncio.sleep(2)
 
-        await respond(e, f"✅ **Плейлист загружен!** ({len(selected)}/{total} видео)")
+        await respond(e, ui.ok(ui.kv("Загружено", f"**{len(selected)}/{total}** видео"),
+                               title="Плейлист загружен"))
     except Exception as ex:
-        await respond(e, f"❌ Ошибка плейлиста: {ex}")
+        await respond(e, ui.err(f"{ex}", title="Плейлист"))
         _log.error(f"playlist error: {ex}")
     db.bump_stat('cmds')
 
@@ -1866,7 +2099,7 @@ async def audio_cmd(e):
 
     url = e.pattern_match.group(1).strip()
 
-    status_msg = await respond(e, "⏳ Загрузка аудио...")
+    status_msg = await respond(e, ui.card("⏳ Загрузка аудио", "запрос отправлен…"))
 
     async def edit_fn(text):
         try:
@@ -1879,7 +2112,7 @@ async def audio_cmd(e):
         if filename:
             await send_and_clean(edit_fn, client, e.chat_id, filename, f"🎵 Аудио")
     except Exception as ex:
-        await safe_edit(status_msg, f"❌ Ошибка: {ex}")
+        await safe_edit(status_msg, ui.err(f"{ex}", title="Аудио"))
         _log.error(f"audio error: {ex}")
     db.bump_stat('cmds')
 
@@ -1891,7 +2124,7 @@ async def sub_cmd(e):
     url = g.group(1).strip()
     lang = (g.group(2) or 'ru').lower()
 
-    msg = await respond(e, f"⏳ Ищу субтитры ({lang})...")
+    msg = await respond(e, ui.card("⏳ Субтитры", ui.rows(("Язык", f"`{lang}`"))))
     try:
         def _get_captions():
             out_dir = os.path.join(MEDIA_DIR, 'subtmp')
@@ -1945,18 +2178,20 @@ async def sub_cmd(e):
             sub_path = os.path.join(MEDIA_DIR, f'sub_{lang}.srt')
             with open(sub_path, 'w', encoding='utf-8') as f:
                 f.write(srt_content)
-            await msg.edit(f"📤 Отправляю субтитры ({lang})...")
+            await msg.edit(ui.card("📤 Субтитры", ui.rows(("Язык", f"`{lang}`"),
+                                                          ("Статус", "отправляю…"))))
             await client.send_file(e.chat_id, sub_path, caption=f"📝 Субтитры ({lang})")
             await asyncio.sleep(3)
             try:
                 os.remove(sub_path)
             except OSError:
                 pass
-            await msg.edit(f"✅ Субтитры ({lang}) отправлены.")
+            await msg.edit(ui.ok(ui.kv("Язык", f"`{lang}`"), title="Субтитры отправлены"))
         else:
-            await msg.edit(f"❌ Субтитры ({lang}) не найдены для этого видео.")
+            await msg.edit(ui.err(f"Субтитры ({lang}) не найдены для этого видео.",
+                                  title="Субтитры"))
     except Exception as ex:
-        await msg.edit(f"❌ Ошибка: {ex}")
+        await msg.edit(ui.err(f"{ex}", title="Субтитры"))
         logger.error(f"sub error: {ex}")
     db.bump_stat('cmds')
 
@@ -1967,7 +2202,7 @@ async def watch_cmd(e):
     arg = e.pattern_match.group(1)
     if arg == 'on':
         if _watch_task and not _watch_task.done():
-            await respond(e, "⚠️ Мониторинг уже запущен.")
+            await respond(e, ui.warn("Мониторинг уже запущен.", title="Watch"))
             return
         db.clear_sessions()
         try:
@@ -2005,12 +2240,16 @@ async def watch_cmd(e):
                 await asyncio.sleep(300)
 
         _watch_task = asyncio.create_task(monitor())
-        await respond(e, "👁️ **Мониторинг сессий ВКЛЮЧЁН.** Проверка каждые 5 мин.")
+        await respond(e, ui.card("👁️ Мониторинг сессий",
+                                 ui.rows(("Статус", "включён ✅"),
+                                         ("Проверка", "каждые 5 мин")),
+                                 footer="Уведомления о новых входах — во внешний бот."))
     else:
         if _watch_task and not _watch_task.done():
             _watch_task.cancel()
             _watch_task = None
-        await respond(e, "👁️ **Мониторинг сессий ВЫКЛЮЧЕН.**")
+        await respond(e, ui.card("👁️ Мониторинг сессий",
+                                 ui.rows(("Статус", "выключен ❌"))))
     db.bump_stat('cmds')
 
 
@@ -2018,7 +2257,7 @@ async def watch_cmd(e):
 async def check_email_cmd(e):
 
     email = e.pattern_match.group(1).strip().lower()
-    msg = await respond(e, f"🔍 Проверяю {email}...")
+    msg = await respond(e, ui.card("🔍 Проверка email", ui.rows(("Email", f"`{email}`"))))
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -2027,29 +2266,35 @@ async def check_email_cmd(e):
                 timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 if resp.status == 404:
-                    await msg.edit(f"✅ **{email}** не найден в известных утечках.")
+                    await msg.edit(ui.ok(ui.kv("Email", f"`{email}`"),
+                                         title="В утечках не найден"))
                 elif resp.status == 200:
                     data = await resp.json()
                     breaches = data.get('breaches', [])
                     if not breaches:
-                        await msg.edit(f"✅ **{email}** не найден в известных утечках.")
+                        await msg.edit(ui.ok(ui.kv("Email", f"`{email}`"),
+                                             title="В утечках не найден"))
                         return
-                    lines = [f"⚠️ **{email}** найден в {len(breaches)} утечках:\n"]
+                    lines = []
                     for b in breaches[:15]:
                         name = b.get('Name', b) if isinstance(b, dict) else b
                         date = b.get('BreachDate', '') if isinstance(b, dict) else ''
                         lines.append(f"• {name}" + (f" ({date})" if date else ""))
                     if len(breaches) > 15:
                         lines.append(f"… и ещё {len(breaches) - 15}")
-                    await msg.edit("\n".join(lines))
+                    await msg.edit(ui.warn(
+                        ui.rows(("Email", f"`{email}`"), ("Утечек", f"**{len(breaches)}**"))
+                        + "\n\n" + "\n".join(lines),
+                        title="Найден в утечках"))
                 elif resp.status == 429:
-                    await msg.edit("❌ Слишком много запросов. Лимит: 100/день на IP.")
+                    await msg.edit(ui.err("Слишком много запросов. Лимит: 100/день на IP.",
+                                          title="Проверка email"))
                 else:
-                    await msg.edit(f"❌ Ошибка API: HTTP {resp.status}")
+                    await msg.edit(ui.err(f"Ошибка API: HTTP {resp.status}", title="Проверка email"))
     except asyncio.TimeoutError:
-        await msg.edit("❌ Таймаут запроса к API.")
+        await msg.edit(ui.err("Таймаут запроса к API.", title="Проверка email"))
     except Exception as ex:
-        await msg.edit(f"❌ Ошибка: {ex}")
+        await msg.edit(ui.err(f"{ex}", title="Проверка email"))
         logger.error(f"check_email error: {ex}")
     db.bump_stat('cmds')
 
@@ -2061,20 +2306,26 @@ async def protect_cmd(e):
     logger.info(f"[PROTECT] вход: sender={e.sender_id} text={repr((e.raw_text or '').strip())} cmd={arg}")
     if not arg:
         if _protect_task and not _protect_task.done():
-            await respond(e, "🔒 **Защита ВКЛЮЧЕНА**\nИспользуй `!protect off` для отключения")
+            await respond(e, ui.card("🔒 Защита", ui.rows(("Статус", "включён ✅")),
+                                     hint="`!protect off` — отключить"))
         else:
-            await respond(e, "🔓 **Защита ВЫКЛЮЧЕНА**\nИспользуй `!protect on` для включения")
+            await respond(e, ui.card("🔓 Защита", ui.rows(("Статус", "выключен ❌")),
+                                     hint="`!protect on` — включить"))
         db.bump_stat('cmds')
         return
     if arg == 'on':
         if _protect_task and not _protect_task.done():
-            await respond(e, "⚠️ Защита уже включена.")
+            await respond(e, ui.warn("Защита уже включена.", title="Protect"))
             return
         dialogs = await client.get_dialogs(limit=1000)
         db.clear_protected_chats()
         for d in dialogs:
             db.add_protected_chat(d.id)
-        await respond(e, f"🔒 **Защита ВКЛЮЧЕНА.** Отслеживается {len(dialogs)} чатов.\nУведомления будут приходить в внешний бот.")
+        await respond(e, ui.card("🔒 Защита включена",
+                                 ui.rows(("Статус", "включён ✅"),
+                                         ("Чатов", f"`{len(dialogs)}`"),
+                                         ("Интервал проверки", "`120с`")),
+                                 footer="Уведомления о пропавших чатах — во внешний бот."))
 
         async def monitor():
             while True:
@@ -2106,7 +2357,9 @@ async def protect_cmd(e):
             _protect_task.cancel()
             _protect_task = None
         db.clear_protected_chats()
-        await respond(e, "🔓 **Защита ВЫКЛЮЧЕНА.**")
+        await respond(e, ui.card("🔓 Защита выключена",
+                                 ui.rows(("Статус", "выключен ❌"),
+                                         ("Чаты", "список очищен"))))
     db.bump_stat('cmds')
 
 
@@ -2279,6 +2532,8 @@ async def pm_cache_incoming(e):
         media_type = None
         if getattr(msg, 'photo', None):
             media_type = 'photo'
+        elif getattr(msg, 'video_note', None):
+            media_type = 'video_note'
         elif getattr(msg, 'video', None):
             media_type = 'video'
         elif getattr(msg, 'document', None):
@@ -2310,6 +2565,8 @@ async def pm_cache_outgoing(e):
         media_type = None
         if getattr(msg, 'photo', None):
             media_type = 'photo'
+        elif getattr(msg, 'video_note', None):
+            media_type = 'video_note'
         elif getattr(msg, 'video', None):
             media_type = 'video'
         elif getattr(msg, 'document', None):
@@ -2339,9 +2596,23 @@ async def pm_edited_handler(e):
         old = db.get_pm_cached(e.chat_id, e.id)
         logger.info(f"[PM-EDIT] chat={e.chat_id} msg_id={e.id} new_empty={not new_text.strip()} has_old={bool(old)}")
 
+        # 1) Текст не изменился — это реакции/закреп/перепин, а не правка.
+        #    Раньше эта проверка стояла ПОСЛЕ проверки на пустой текст, из-за чего
+        #    реакция на фото/стикере (без подписи) считалась удалением.
+        if old is not None and (old['text'] or '') == (new_text or ''):
+            logger.info(f"[PM-EDIT] текст не менялся — пропуск (реакция/пин)")
+            return
+
+        # 2) Сообщения нет в кэше (пришло до старта бота) — сравнивать не с чем,
+        #    отличить правку от реакции нельзя → молчим вместо ложного алерта.
+        if old is None:
+            logger.info(f"[PM-EDIT] нет базы в кэше — пропуск")
+            return
+
+        # 3) Текст очистили — трактуем как удаление (дедуп с raw UpdateDeleteMessages).
         if not new_text.strip():
             username = None
-            if old and old.get('sender_id'):
+            if old.get('sender_id'):
                 try:
                     s = await client.get_entity(old['sender_id'])
                     username = getattr(s, 'username', None)
@@ -2351,9 +2622,6 @@ async def pm_edited_handler(e):
                 e.chat_id, e.id, old=old, username=username,
                 event_sender_id=e.sender_id if e.sender_id else 0, source="edit-empty"
             )
-            return
-
-        if old and (old['text'] or '') == (new_text or ''):
             return
 
         sender = None
@@ -2366,20 +2634,18 @@ async def pm_edited_handler(e):
         if sender:
             sender_name = f"{getattr(sender, 'first_name', '') or ''} {getattr(sender, 'last_name', '') or ''}".strip()
         else:
-            sender_name = old['sender_name'] if old else ''
+            sender_name = old['sender_name'] or ''
 
         if not sender_name:
             sender_name = username or str(e.sender_id)
 
-        old_text = old['text'] if old else ''
+        # 4) Настоящая правка текста.
+        await notify.pm_edited(e.chat_id, e.sender_id, sender_name, old['text'] or '', new_text, username=username)
 
-        await notify.pm_edited(e.chat_id, e.sender_id, sender_name, old_text, new_text, username=username)
-
-        has_media = bool(old['has_media']) if old else bool(e.message.media)
-        media_type = old['media_type'] if old else None
-        db.cache_pm_message(e.chat_id, e.id, e.sender_id, sender_name, new_text, has_media, media_type)
+        db.cache_pm_message(e.chat_id, e.id, e.sender_id, sender_name,
+                             new_text, bool(old['has_media']), old['media_type'])
     except Exception as ex:
-        logger.debug(f"pm_edited_handler err: {ex}")
+        logger.warning(f"pm_edited_handler err: {ex}", exc_info=True)
 
 
 
@@ -2400,72 +2666,88 @@ async def onwatch_unified(e):
         if low == '!onwatchlist' or low.startswith('!onwatchlist '):
             rows = db.get_online_watches()
             if not rows:
-                await respond(e, "📭 Список отслеживаемых пуст.")
+                await respond(e, ui.card("📡 ONWATCH", "список пуст",
+                                         hint="`!onwatch @username|ID <текст>` — добавить"))
                 db.bump_stat('cmds')
                 return
-            lines = ["📡 **ONWATCH**\n"]
+            lines = []
             for r in rows:
-                uname = r['target_username'] or str(r['target_id'])
-                lines.append(f"• **@{uname}** [`{r['target_id']}`] | last: `{r['last_status']}`\n  _{r['message'][:40]}{'...' if len(r['message'])>40 else ''}_")
-            await respond(e, "\n".join(lines))
+                uname = r['target_username']
+                tgt = f"@{uname}" if uname else f"id `{r['target_id']}`"
+                lines.append(f"• **{tgt}** [`{r['target_id']}`] | last: `{r['last_status']}`\n  _{r['message'][:40]}{'...' if len(r['message'])>40 else ''}_")
+            await respond(e, ui.card(f"📡 ONWATCH ({len(rows)})", "\n".join(lines),
+                                     hint="`!unonwatch @username|ID` — снять трек"))
             db.bump_stat('cmds')
             return
 
         if low.startswith('!unonwatch'):
-            m = re.match(r'^!unonwatch\s+(@[\w\d_]+)$', text, re.IGNORECASE)
+            m = re.match(r'^!unonwatch\s+(@?[\w\d_]+)$', text, re.IGNORECASE)
             if not m:
-                await respond(e, "ℹ️ Использование: `!unonwatch @username`")
+                await respond(e, ui.usage("!unonwatch @username|ID", title="Снять отслеживание"))
                 db.bump_stat('cmds')
                 return
             target_raw = m.group(1)
-            username = target_raw.lstrip('@')
             try:
-                ent = await client.get_entity(username)
+                ent = await resolve_entity(target_raw)
             except Exception as ex:
-                await respond(e, f"❌ Не найден: {ex}")
+                await respond(e, ui.err(f"Не найден: {ex}", title="ONWATCH",
+                                        hint="Формат: `!unonwatch @username|ID`"))
                 db.bump_stat('cmds')
                 return
             db.remove_online_watch(target_id=ent.id)
-            await respond(e, f"🗑 Отслеживание **@{username}** снято.")
+            await respond(e, ui.ok(ui.kv("Цель", f"**{entity_label(ent, target_raw.lstrip('@'))}**"),
+                                   title="Отслеживание снято"))
             db.bump_stat('cmds')
             return
 
         if low.startswith('!onwatch '):
-            m = re.match(r'^!onwatch\s+(@[\w\d_]+)\s+(.+)$', text, re.IGNORECASE | re.DOTALL)
+            m = re.match(r'^!onwatch\s+(@?[\w\d_]+)\s+(.+)$', text, re.IGNORECASE | re.DOTALL)
             if not m:
-                await respond(e, "ℹ️ Использование: `!onwatch @username текст сообщения`")
+                await respond(e, ui.usage("!onwatch @username|ID <текст сообщения>",
+                                          title="ONWATCH"))
                 db.bump_stat('cmds')
                 return
             target_raw = m.group(1)
             msg_text = m.group(2).strip()
-            username = target_raw.lstrip('@')
             try:
-                ent = await client.get_entity(username)
+                ent = await resolve_entity(target_raw)
             except Exception as ex:
-                await respond(e, f"❌ Не удалось найти пользователя: {ex}")
+                await respond(e, ui.err(f"Не удалось найти пользователя: {ex}",
+                                        title="ONWATCH",
+                                        hint="Можно указать числовой ID: `!onwatch 12345 Привет`"))
                 db.bump_stat('cmds')
                 return
             if getattr(ent, 'bot', False):
-                await respond(e, "❌ Нельзя следить за ботом.")
+                await respond(e, ui.err("За ботами следить нельзя.", title="ONWATCH"))
                 db.bump_stat('cmds')
                 return
             try:
-                db.add_online_watch(ent.id, getattr(ent, 'username', username) or username, msg_text, OWNER_ID, e.chat_id)
+                db.add_online_watch(ent.id, getattr(ent, 'username', None) or '', msg_text, OWNER_ID, e.chat_id)
             except Exception as ex:
-                await respond(e, f"❌ Ошибка БД: {ex}")
+                await respond(e, ui.err(f"Ошибка БД: {ex}", title="ONWATCH"))
                 db.bump_stat('cmds')
                 return
-            await respond(e, f"✅ Буду караулить **@{getattr(ent,'username',username)}**\nКак только он появится в сети (после оффлайна) — отправлю ему сообщение и уведомлю в боте.\n\nТрек работает раз за разом.")
+            await respond(e, ui.card(
+                "✅ ONWATCH добавлен",
+                ui.rows(
+                    ("Цель", f"**{entity_label(ent, target_raw.lstrip('@'))}**"),
+                    ("Сообщение", f"_{msg_text}_"),
+                ),
+                footer="Как только цель окажется в сети после оффлайна — отправлю сообщение и уведомлю во внешнем боте.\nТрек работает раз за разом.",
+            ))
             db.bump_stat('cmds')
             return
 
-        await respond(e, "ℹ️ Использование: `!onwatch @username текст сообщения` | `!onwatchlist` | `!unonwatch @username`")
+        await respond(e, ui.usage("!onwatch @username|ID <текст>",
+                                  "!onwatchlist",
+                                  "!unonwatch @username|ID",
+                                  title="ONWATCH"))
         db.bump_stat('cmds')
         return
     except Exception as ex:
         logger.error(f"onwatch_unified err: {ex}")
         try:
-            await respond(e, f"❌ Ошибка: {ex}")
+            await respond(e, ui.err(f"Ошибка: {ex}", title="ONWATCH"))
         except Exception:
             pass
 
@@ -2563,13 +2845,125 @@ async def rphelp_cmd(event):
     sender = await event.get_sender()
     if not sender:
         return
-    lines = ["📚 **Доступные RP-команды**\n"]
+    lines = []
     for category in get_all_categories():
         cmds = get_category_commands(category)
         if cmds:
-            lines.append(f"\n**{category.upper()}**: {', '.join(f'`{c}`' for c in cmds)}")
-    await event.reply("\n".join(lines))
+            lines.append(f"**{category.upper()}**: {', '.join(f'`{c}`' for c in cmds)}")
+    await event.reply(ui.card("🎭 RP-команды", "\n".join(lines),
+                              footer="Напишите команду в ответ на сообщение.\nЧерез Enter можно добавить свою реплику."))
     db.bump_stat('cmds')
+
+# ── Внешний бот (@nemusechkabot): !menu и приём нажатий инлайн-кнопок ──
+# Связка: юзербот шлёт боту сообщения с кнопками, сам опрашивает getUpdates
+# (см. notifier.poll_updates) и редактирует сообщения бота по нажатиям.
+
+BACK_BTN = {"text": "◀️ Меню", "callback_data": "h:back"}
+
+
+def _persist_business_connection(bc):
+    """Сохраняет id бизнес-соединения в БД — переживает рестарт юзербота
+    (Telegram присылает business_connection только при подключении/изменении)."""
+    try:
+        if bc.get('is_enabled', True) and bc.get('id'):
+            db.set_saved('_biz_conn', bc['id'])
+        else:
+            db.del_saved('_biz_conn')
+    except Exception as ex:
+        logger.warning(f"persist business_connection: {ex}")
+
+
+notify.on_business_connection = _persist_business_connection
+
+
+async def _pult_toggle(action):
+    """Переключает режим пульта. Возвращает текст-описание действия (или None)."""
+    if action == 'ghost':
+        state.toggle_ghost()
+        return ("Ghost включён — команды удаляются мгновенно" if state.ghost_mode
+                else "Ghost выключен")
+    if action == 'cover':
+        state.set_cover(not state.cover_enabled)
+        return ("Cover включён — работают только `!cover off` и `!status_reset`"
+                if state.cover_enabled else "Cover выключен")
+    if action == 'silent':
+        state.set_silent(not state.silent_enabled)
+        return ("Silent включён — бот молчит в ЛС"
+                if state.silent_enabled else "Silent выключен")
+    if action == 'mute':
+        state.set_mute(not state.mute_enabled)
+        return ("Mute включён — все ЛС игнорируются"
+                if state.mute_enabled else "Mute выключен")
+    if action == 'lock':
+        state.set_lock(not state.lock_enabled)
+        return ("Lock включён — бот отвечает только контактам"
+                if state.lock_enabled else "Lock выключен")
+    return None
+
+
+async def handle_bot_callback(q):
+    """callback_query от внешнего бота: пульт (c:*) и справка (h:*)."""
+    data = q.get('data') or ''
+    qid = q.get('id')
+    uid = (q.get('from') or {}).get('id')
+    # сообщение, на котором висит кнопка: если оно отправлено от имени аккаунта
+    # (Telegram Business) — в нём есть business_connection_id, он обязателен для edit
+    msg = q.get('message') or {}
+    mid = msg.get('message_id')
+    biz = msg.get('business_connection_id')
+
+    if uid != OWNER_ID:
+        await notify.answer_callback(qid, "⛔ Нет доступа", alert=True)
+        return
+    await notify.answer_callback(qid)
+    if not mid:
+        return
+
+    # пульт: статус / пинг — отдельные карточки с кнопкой «назад»
+    if data in ('c:status', 'c:ping'):
+        if data == 'c:status':
+            card = await build_status_card()
+        else:
+            t0 = time.monotonic()
+            try:
+                await client.get_me()
+            except Exception:
+                pass
+            ms = (time.monotonic() - t0) * 1000
+            q_show = "🟢 Отлично" if ms < 300 else "🟡 Нормально" if ms < 700 else "🔴 Высокая"
+            card = ui.card("🏓 Пинг (MTProto)",
+                           ui.rows(("Задержка", f"`{ms:.1f} мс`", "⚡"),
+                                   ("Качество", q_show, "📶")))
+        await notify.edit(mid, ui.to_html(card), buttons=[[dict(BACK_BTN)]],
+                          business_connection_id=biz)
+        return
+
+    # пульт: переключение режимов → перерисовать меню с новым состоянием
+    if data.startswith('c:'):
+        last = await _pult_toggle(data[2:])
+        text, buttons = help_data.menu_view(last_action=last)
+        await notify.edit(mid, ui.to_html(text), buttons=buttons,
+                          business_connection_id=biz)
+        return
+
+    # справка: навигация по разделам (h:back / h:all / h:<раздел>)
+    text, buttons = help_data.help_view(data)
+    await notify.edit(mid, ui.to_html(text), buttons=buttons,
+                      business_connection_id=biz)
+
+
+@client.on(events.NewMessage(pattern=r'!menu$', func=owner_filter))
+async def menu_cmd(e):
+    text, buttons = help_data.menu_view()
+    sent = await notify.send(ui.to_html(text), buttons=buttons)
+    if sent:
+        await respond(e, ui.ok("Меню с кнопками отправлено в чат бота.", title="Меню",
+                               hint="Кнопки работают только в чате внешнего бота"))
+    else:
+        await respond(e, ui.err("Не удалось отправить меню.\nПроверь `NOTIFY_BOT_TOKEN` и `NOTIFY_CHAT_ID`.",
+                                title="Меню"))
+    db.bump_stat('cmds')
+
 
 import help_data
 
@@ -2625,6 +3019,24 @@ if __name__ == "__main__":
             logger.info("[TASK] pm_delete_worker запущен")
     except Exception as e:
         logger.warning(f"[TASK] pm_delete_worker не запущен: {e}")
+
+    # приём нажатий инлайн-кнопок внешнего бота (getUpdates long-poll)
+    try:
+        saved_biz = db.get_saved('_biz_conn')
+        if saved_biz:
+            notify.business_connection_id = saved_biz
+            logger.info(f"[TASK] business_connection_id восстановлен из БД: {saved_biz}")
+    except Exception as e:
+        logger.warning(f"[TASK] business_connection не восстановлен: {e}")
+
+    try:
+        if notify.enabled:
+            client.loop.create_task(notify.poll_updates(handle_bot_callback))
+            logger.info("[TASK] external_bot_poll запущен")
+        else:
+            logger.info("[TASK] external_bot_poll пропущен: NOTIFY_* не заданы")
+    except Exception as e:
+        logger.warning(f"[TASK] external_bot_poll не запущен: {e}")
 
     try:
         # Базовая линия: первая сверка только фиксирует наличие сообщений,

@@ -3,11 +3,14 @@ from client import client
 from core import state, db, owner_filter, respond
 from config import logger
 from rp_commands import get_all_categories, get_category_commands
+from notifier import notify
+import ui
 
 CMD_DESCS = {
     'sleep':       {'desc': 'Включить автоответчик', 'syntax': '!sleep', 'example': '!sleep'},
     'wake':        {'desc': 'Выключить автоответчик', 'syntax': '!wake', 'example': '!wake'},
     'setreply':    {'desc': 'Установить текст ответа', 'syntax': '!setreply [@user|default] [текст]', 'example': '!setreply @username Привет'},
+    'menu':         {'desc': 'Интерактивное меню с кнопками во внешнем боте', 'syntax': '!menu', 'example': '!menu'},
     'status':      {'desc': 'Полный статус бота', 'syntax': '!status', 'example': '!status'},
     'time':        {'desc': 'Текущее время и дата', 'syntax': '!time', 'example': '!time'},
     'ping':        {'desc': 'Проверить задержку', 'syntax': '!ping', 'example': '!ping'},
@@ -116,7 +119,7 @@ CMD_DESCS = {
 COMMANDS_LIST = {
     'основные': [
         '!sleep', '!wake', '!setreply', '!status', '!time', '!ping',
-        '!id', '!info', '!restart', '!ghost', '!resetdata'
+        '!id', '!info', '!menu', '!restart', '!ghost', '!resetdata'
     ],
     'стелс': [
         '!cover', '!silent', '!shadow', '!lock', '!mute',
@@ -171,6 +174,7 @@ HELP_CATS = {
         "`!wake` — выключить автоответчик\n"
         "`!setreply [@user | default] [текст]` — текст ответа\n"
         "`!status` — полный статус бота\n"
+        "`!menu` — меню с кнопками во внешнем боте\n"
         "`!time` — время и дата\n"
         "`!ping` — задержка соединения\n"
         "`!id` — ID чата / пользователя\n"
@@ -269,7 +273,7 @@ HELP_CATS = {
         "`!onwatch @user <текст>` — караулить появление в сети. Отправит сообщение таргету и уведомит в боте\n"
         "`!onwatchlist` — список активных треков\n"
         "`!unonwatch @user` — снять отслеживание\n\n"
-        "<i>Срабатывает по переходу оффлайн -> онлайн, работает раз за разом</i>"
+        "_Срабатывает по переходу оффлайн -> онлайн, работает раз за разом_"
     ),
     'безопасность': (
         "🔐 **БЕЗОПАСНОСТЬ**\n\n"
@@ -306,37 +310,132 @@ HELP_CATS = {
 }
 
 
+HELP_TITLES = {
+    'основные': 'Основные команды',
+    'стелс': 'Стелс-режимы',
+    'профиль': 'Профиль',
+    'игры': 'Игры и развлечения',
+    'youtube': 'Загрузка медиа',
+    'утилиты': 'Утилиты',
+    'сообщения': 'Сообщения',
+    'заметки': 'Заметки и TODO',
+    'онлайн': 'Онлайн-караул',
+    'безопасность': 'Безопасность',
+    'afk': 'AFK',
+    'инфо': 'Информация о чате',
+    'rp': 'RP-команды',
+}
+
+
+# ── Внешний бот: меню с инлайн-кнопками (пульт + справка) ──
+# Тексты — те же карточки ui.*, но отправляются Bot API (HTML через ui.to_html).
+
+def _b(text, data):
+    return {"text": text, "callback_data": data}
+
+
+def _mark(v):
+    return "✅" if v else "❌"
+
+
+def menu_view(last_action=None):
+    """Главное меню бота: состояние режимов + пульт + разделы справки."""
+    modes = ui.rows(
+        ("Ghost", _mark(state.ghost_mode), "👻"),
+        ("Cover", _mark(state.cover_enabled), "🛡️"),
+        ("Silent", _mark(state.silent_enabled), "🤐"),
+        ("Mute", _mark(state.mute_enabled), "🔇"),
+        ("Lock", _mark(state.lock_enabled), "🔒"),
+    )
+    body = f"Последнее действие: _{last_action}_\n\n{modes}" if last_action else modes
+    text = ui.card("🎮 Меню UserBot", body,
+                   hint="Кнопки: пульт сверху, разделы справки ниже. `!menu` — переслать меню ещё раз.")
+    cats = list(HELP_CATS.keys())
+    cat_rows = [[_b(f"{EMOJI_MAP.get(c, '•')} {c}", f"h:{c}") for c in cats[i:i + 2]]
+                for i in range(0, len(cats), 2)]
+    buttons = [
+        [_b("📊 Статус", "c:status"), _b("🏓 Пинг", "c:ping")],
+        [_b(f"👻 Ghost {_mark(state.ghost_mode)}", "c:ghost"),
+         _b(f"🛡️ Cover {_mark(state.cover_enabled)}", "c:cover")],
+        [_b(f"🤐 Silent {_mark(state.silent_enabled)}", "c:silent"),
+         _b(f"🔇 Mute {_mark(state.mute_enabled)}", "c:mute"),
+         _b(f"🔒 Lock {_mark(state.lock_enabled)}", "c:lock")],
+        [_b("📋 Все команды", "h:all")],
+    ] + cat_rows
+    return text, buttons
+
+
+def _all_commands_body():
+    parts = []
+    for cat, cmds in COMMANDS_LIST.items():
+        emoji = EMOJI_MAP.get(cat, '•')
+        parts.append(f"{emoji} **{cat.capitalize()}**\n" + ", ".join(f"`{c}`" for c in cmds) + "\n")
+    return "\n".join(parts).strip()
+
+
+def _category_body(cat):
+    raw = HELP_CATS[cat]
+    # первая строка словаря — старый заголовок, его заменяет шапка карточки
+    body = raw.split("\n\n", 1)[1] if "\n\n" in raw else raw
+    cmds = COMMANDS_LIST.get(cat, [])
+    if cmds:
+        body += "\n\n📋 " + " ".join(f"`{c}`" for c in cmds)
+    return body
+
+
+def help_view(data):
+    """callback_data 'h:*' → (текст-карточка, кнопки) для editMessageText."""
+    if data == 'h:all':
+        return (ui.card("📋 Все команды", _all_commands_body(),
+                        footer="◀️ Меню — назад"),
+                [[_b("◀️ Меню", "h:back")]])
+    cat = (data or '')[2:] if data and data.startswith('h:') else ''
+    if cat in HELP_CATS:
+        text = ui.card(
+            f"{EMOJI_MAP.get(cat, '•')} {HELP_TITLES.get(cat, cat.capitalize())}",
+            _category_body(cat),
+            footer="◀️ Меню — назад · пульт (Статус/Пинг) — внизу",
+        )
+        buttons = [
+            [_b("◀️ Меню", "h:back"), _b("📋 Все команды", "h:all")],
+            [_b("📊 Статус", "c:status"), _b("🏓 Пинг", "c:ping")],
+        ]
+        return text, buttons
+    return menu_view()
+
+
 @client.on(events.NewMessage(pattern=r'!help(?:\s+(.+))?$', func=owner_filter))
 async def help_cmd(e):
     arg = (e.pattern_match.group(1) or '').strip().lower()
+    cats_line = " · ".join(f"`!help {c}`" for c in HELP_CATS)
 
     if arg.startswith('cmd '):
         cmd_name = arg[4:].strip().lstrip('!')
         if cmd_name in CMD_DESCS:
             d = CMD_DESCS[cmd_name]
-            lines = [
-                f"📖 **Команда:** `!{cmd_name}`",
-                f"**Описание:** {d['desc']}",
-                f"**Синтаксис:** `{d['syntax']}`",
-                f"**Пример:** `{d['example']}`",
-            ]
-            lines.append("\n💡 Для справки по команде: `!help cmd <команда>`")
-            lines.append("💡 Для всех команд: `!help all`")
-            await respond(e, "\n".join(lines))
-            db.bump_stat('cmds')
-            return
+            await respond(e, ui.card(
+                f"📖 !{cmd_name}",
+                ui.rows(
+                    ("Описание", d['desc']),
+                    ("Синтаксис", f"`{d['syntax']}`"),
+                    ("Пример", f"`{d['example']}`"),
+                ),
+                footer="`!help` — все разделы · `!help all` — все команды",
+            ))
         else:
-            await respond(e, f"❌ Команда `{cmd_name}` не найдена.\n💡 `!help cmd <команда>`")
-            db.bump_stat('cmds')
-            return
+            await respond(e, ui.err(f"Команда `{cmd_name}` не найдена", title="Справка",
+                                    hint="`!help all` — список всех команд"))
+        db.bump_stat('cmds')
+        return
 
     if arg == 'all':
-        msg = "📋 **Все команды:**\n"
+        parts = []
         for cat, cmds in COMMANDS_LIST.items():
             emoji = EMOJI_MAP.get(cat, '•')
             cmds_str = ", ".join(f"`{cmd}`" for cmd in cmds)
-            msg += f"\n{emoji} **{cat.capitalize()}:** {cmds_str}\n"
-        msg += "\n💡 Для справки по команде: `!help cmd <команда>`\n💡 Для всех категорий: `!help <категория>`"
+            parts.append(f"{emoji} **{cat.capitalize()}**\n{cmds_str}\n")
+        msg = ui.card("📋 Все команды", "\n".join(parts).strip(),
+                      footer="`!help cmd <команда>` — описание · `!help <раздел>` — один раздел")
         if len(msg) > 4096:
             msg = msg[:4080] + "\n\n⚠️ Сообщение обрезано (лимит 4096)"
         await respond(e, msg)
@@ -346,27 +445,40 @@ async def help_cmd(e):
     if arg:
         cat = arg
         if cat not in HELP_CATS:
-            cats = ', '.join(f"`!help {c}`" for c in HELP_CATS)
-            await respond(e, f"❌ Категория `{cat}` не найдена.\n\nДоступные категории:\n{cats}")
+            await respond(e, ui.err(f"Раздел `{cat}` не найден", title="Справка",
+                                    hint=f"Разделы: {cats_line}"))
             db.bump_stat('cmds')
             return
-        text = HELP_CATS[cat]
-        cmds = COMMANDS_LIST.get(cat, [])
-        if cmds:
-            text += "\n\n📋 **Команды для копирования:**\n" + ", ".join(f"`{cmd}`" for cmd in cmds)
-        text += "\n\n💡 Для справки по команде: `!help cmd <команда>`\n💡 Для всех команд: `!help all`"
-        await respond(e, text)
+        body = _category_body(cat)
+        await respond(e, ui.card(
+            f"{EMOJI_MAP.get(cat, '•')} {HELP_TITLES.get(cat, cat.capitalize())}",
+            body,
+            footer="`!help cmd <команда>` — описание одной команды · `!help` — назад",
+        ))
         db.bump_stat('cmds')
         return
 
-    lines = ["📚 **UserBot Help**\n\nВыбери категорию — скопируй команду и отправь:\n"]
+    lines = ["Выбери раздел — скопируй нужную команду и отправь:\n"]
     for cat_name in HELP_CATS:
         emoji = EMOJI_MAP.get(cat_name, '•')
-        lines.append(f"{emoji} `{cat_name.capitalize()}` → `!help {cat_name}`")
-    lines.append("\n💡 Для справки по команде: `!help cmd <команда>`")
-    lines.append("💡 Для всех команд: `!help all`")
-    await respond(e, "\n".join(lines))
+        lines.append(f"{emoji} `!help {cat_name}` — {HELP_TITLES.get(cat_name, cat_name.capitalize())}")
+    await respond(e, ui.card(
+        "📚 Справка",
+        "\n".join(lines),
+        footer="`!help cmd <команда>` — описание одной команды\n`!help all` — все команды сразу",
+    ))
     db.bump_stat('cmds')
+
+    # продублировать меню с кнопками в чат внешнего бота
+    if notify.enabled:
+        try:
+            teaser = ui.card("🎮 Меню с кнопками",
+                             "пульт и справка — интерактивно, прямо в этом чате",
+                             hint="или команда `!menu` в ЛС юзербота")
+            await notify.send(ui.to_html(teaser),
+                              buttons=[[_b("📚 Открыть меню", "h:back")]])
+        except Exception:
+            pass
 
 @client.on(events.NewMessage(pattern=r'!trhelp$', func=owner_filter))
 async def trhelp_cmd(e):
@@ -376,7 +488,8 @@ async def trhelp_cmd(e):
     for i, chunk in enumerate(chunks):
         lines = [f"`{c}` — {LANG_CODES[c]}" for c in chunk]
         if i == 0:
-            lines.insert(0, "🌐 **Коды языков Google Translate**\n")
+            lines.insert(0, ui.SEP)
+            lines.insert(0, "**🌐 Коды языков Google Translate**")
             lines.append("\n💡 Использование: `!translate <код> [текст]`")
             await respond(e, "\n".join(lines))
         else:
