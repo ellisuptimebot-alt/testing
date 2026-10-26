@@ -70,9 +70,20 @@ class Storage:
                     has_media INTEGER DEFAULT 0,
                     media_type TEXT,
                     date INTEGER,
+                    verified INTEGER DEFAULT 1,
+                    last_seen INTEGER DEFAULT 0,
                     PRIMARY KEY(chat_id, msg_id)
                 );
             ''')
+            # Миграция для существующих баз: добавляем отсутствующие колонки
+            cur.execute('PRAGMA table_info(pm_msg_cache)')
+            cols = {row[1] for row in cur.fetchall()}
+            if 'verified' not in cols:
+                cur.execute('ALTER TABLE pm_msg_cache ADD COLUMN verified INTEGER DEFAULT 1')
+            if 'last_seen' not in cols:
+                cur.execute('ALTER TABLE pm_msg_cache ADD COLUMN last_seen INTEGER DEFAULT 0')
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_pm_msg_id ON pm_msg_cache(msg_id)')
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_pm_chat_date ON pm_msg_cache(chat_id, date)')
             self.conn.commit()
 
     # ── Generic helpers ──
@@ -243,18 +254,37 @@ class Storage:
 
     # ── Protected chats (!protect) ──
 
+    # В таблице первичный ключ называется chat_id (а не key), поэтому
+    # generic-хелперы _set/_keys/_delete тут не подходят — используем явный SQL.
     def add_protected_chat(self, chat_id):
-        self._set('protected_chats', str(chat_id), str(int(time.time())))
+        with self.lock:
+            self.conn.execute(
+                'INSERT OR REPLACE INTO protected_chats (chat_id, value) VALUES (?, ?)',
+                (str(chat_id), str(int(time.time())))
+            )
+            self.conn.commit()
 
     def get_protected_chat_ids(self):
-        raw = self._keys('protected_chats')
-        return [int(x) for x in raw]
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute('SELECT chat_id FROM protected_chats')
+            out = []
+            for row in cur.fetchall():
+                try:
+                    out.append(int(row[0]))
+                except (TypeError, ValueError):
+                    continue
+            return out
 
     def del_protected_chat(self, chat_id):
-        self._delete('protected_chats', str(chat_id))
+        with self.lock:
+            self.conn.execute('DELETE FROM protected_chats WHERE chat_id = ?', (str(chat_id),))
+            self.conn.commit()
 
     def clear_protected_chats(self):
-        self._delete_all('protected_chats')
+        with self.lock:
+            self.conn.execute('DELETE FROM protected_chats')
+            self.conn.commit()
 
     # ── Online watch ──
 
@@ -295,10 +325,11 @@ class Storage:
     # ── PM message cache ──
 
     def cache_pm_message(self, chat_id, msg_id, sender_id, sender_name, text, has_media, media_type):
+        now = int(time.time())
         with self.lock:
             self.conn.execute(
-                'INSERT OR REPLACE INTO pm_msg_cache (chat_id, msg_id, sender_id, sender_name, text, has_media, media_type, date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                (int(chat_id), int(msg_id), int(sender_id) if sender_id else 0, sender_name or '', text or '', 1 if has_media else 0, media_type or '', int(time.time()))
+                'INSERT OR REPLACE INTO pm_msg_cache (chat_id, msg_id, sender_id, sender_name, text, has_media, media_type, date, verified, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)',
+                (int(chat_id), int(msg_id), int(sender_id) if sender_id else 0, sender_name or '', text or '', 1 if has_media else 0, media_type or '', now, now)
             )
             self.conn.commit()
 
@@ -309,9 +340,58 @@ class Storage:
             row = cur.fetchone()
             return dict(row) if row else None
 
+    def get_pm_cached_by_msg(self, msg_id):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute('SELECT * FROM pm_msg_cache WHERE msg_id = ? ORDER BY date DESC LIMIT 1', (int(msg_id),))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
     def delete_pm_cached(self, chat_id, msg_id):
         with self.lock:
             self.conn.execute('DELETE FROM pm_msg_cache WHERE chat_id = ? AND msg_id = ?', (int(chat_id), int(msg_id)))
+            self.conn.commit()
+
+    def get_pm_chats_for_check(self, max_age=259200, limit=20):
+        """Чаты с самыми свежими сообщениями в кэше (для сверки)."""
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                'SELECT chat_id, MAX(date) AS d FROM pm_msg_cache WHERE date >= ? '
+                'GROUP BY chat_id ORDER BY d DESC LIMIT ?',
+                (int(time.time()) - int(max_age), int(limit))
+            )
+            return [row['chat_id'] for row in cur.fetchall()]
+
+    def get_pm_rows_for_check(self, chat_id, max_age=259200, limit=100):
+        """Сообщения конкретного чата, которые надо проверить на существование."""
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                'SELECT * FROM pm_msg_cache WHERE chat_id = ? AND date >= ? '
+                'ORDER BY msg_id DESC LIMIT ?',
+                (int(chat_id), int(time.time()) - int(max_age), int(limit))
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    def mark_pm_alive(self, chat_id, msg_ids):
+        if not msg_ids:
+            return
+        ids = [int(i) for i in msg_ids]
+        placeholders = ','.join('?' * len(ids))
+        with self.lock:
+            self.conn.execute(
+                f'UPDATE pm_msg_cache SET verified = 1, last_seen = ? '
+                f'WHERE chat_id = ? AND msg_id IN ({placeholders})',
+                [int(time.time()), int(chat_id), *ids]
+            )
+            self.conn.commit()
+
+    def reset_pm_verified(self):
+        """Сброс базы на старте: первая сверка только фиксирует наличие,
+        чтобы не заваливать уведомлениями за время оффлайна."""
+        with self.lock:
+            self.conn.execute('UPDATE pm_msg_cache SET verified = 0')
             self.conn.commit()
 
     def clean_pm_cache(self, limit=4000):

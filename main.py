@@ -21,6 +21,7 @@ from client import client
 from telethon.tl.functions.account import (
     GetAuthorizationsRequest,
 )
+from telethon.tl import types
 from telethon.tl.functions.messages import SendReactionRequest
 from telethon.tl.types import (
     ChannelParticipantsAdmins, ChannelParticipantsBots, InputMediaDice,
@@ -57,67 +58,106 @@ _protect_task = None
 _pm_delete_queue = asyncio.Queue()
 _pm_delete_worker_started = False
 
-from telethon.tl import types
+# Дедупликация: одно удаление может прийти и как MessageEdited(empty),
+# и как RAW UpdateDeleteMessages. Ключ — msg_id (уникален в рамках аккаунта).
+_pm_delete_seen = {}
+
+
+def _pm_delete_is_new(msg_id, ttl=20):
+    now = time.monotonic()
+    for k in [k for k, v in _pm_delete_seen.items() if now - v > ttl]:
+        _pm_delete_seen.pop(k, None)
+    mid = int(msg_id)
+    if mid in _pm_delete_seen:
+        return False
+    _pm_delete_seen[mid] = now
+    return True
+
+
+# Удаления, которые сделал сам юзербот (ghost/autodel) — о них уведомлять не надо
+_pm_suppress_delete = set()
+
+
+def suppress_pm_delete(msg_id):
+    try:
+        _pm_suppress_delete.add(int(msg_id))
+    except Exception:
+        return
+    if len(_pm_suppress_delete) > 5000:
+        _pm_suppress_delete.clear()
+
+
+async def _enqueue_pm_delete(chat_id, msg_id, old=None, username=None, event_sender_id=0, source="?"):
+    """Единая точка постановки удаления в очередь (raw / edit / сверка)."""
+    if not chat_id:
+        return
+    try:
+        mid = int(msg_id)
+    except Exception:
+        return
+    if mid in _pm_suppress_delete:
+        _pm_suppress_delete.discard(mid)
+        logger.info(f"[PM-DEL] msg={mid} удалён самим ботом — пропуск")
+        return
+    if old is None:
+        try:
+            old = db.get_pm_cached(chat_id, mid)
+        except Exception:
+            old = None
+    if not _pm_delete_is_new(mid):
+        logger.info(f"[PM-DEL] msg={mid} уже обработан, дедуп")
+        return
+    await ensure_pm_delete_worker()
+    logger.info(f"[PM-DEL] {source}: chat={chat_id} msg={mid} has_old={bool(old)}")
+    await _pm_delete_queue.put({
+        'chat_id': chat_id,
+        'msg_id': mid,
+        'old': old,
+        'username': username,
+        'event_sender_id': event_sender_id,
+    })
+
 
 @client.on(events.Raw)
 async def pm_delete_raw_update(e):
     try:
-        u = e.update
-        u_type = type(u).__name__
-        
-        # Логируем все события, связанные с удалением, чтобы увидеть их в консоли
-        if 'Delete' in u_type:
-            logger.info(f"[PM-DEL-RAW] Получен апдейт удаления: {u_type} -> {u}")
-
-        if isinstance(u, types.UpdateDeleteMessages):
-            msg_ids = list(u.messages or [])
-            logger.info(f"[PM-DEL-RAW] UpdateDeleteMessages: ID сообщений {msg_ids}")
-            await ensure_pm_delete_worker()
-            
-            for msg_id in msg_ids:
-                # Так как у UpdateDeleteMessages нет peer, ищем чат по нашему локальному кэшу сообщений
-                cid = None
-                if hasattr(db, 'find_chat_by_msg_id'):
-                    cid = db.find_chat_by_msg_id(msg_id)
-                
-                old = db.get_pm_cached(cid, msg_id) if cid else None
-                
-                # Если сходу не нашли чат, попытаемся пройти по всем последним чатам из кэша (если база поддерживает)
-                if not old and hasattr(db, 'get_all_pm_cache_keys'):
-                    for test_cid in db.get_all_pm_cache_keys():
-                        maybe_old = db.get_pm_cached(test_cid, msg_id)
-                        if maybe_old:
-                            cid = test_cid
-                            old = maybe_old
-                            break
-
-                username = None
-                if old and old.get('sender_id'):
-                    try:
-                        s = await client.get_entity(old['sender_id'])
-                        username = getattr(s, 'username', None)
-                    except Exception:
-                        pass
-
-                logger.info(f"[PM-DEL-RAW] Клад: chat={cid} msg={msg_id} has_old={bool(old)}")
-                await _pm_delete_queue.put({
-                    'chat_id': cid,
-                    'msg_id': msg_id,
-                    'old': old,
-                    'username': username,
-                })
-                await asyncio.sleep(0.01)
+        # events.Raw передаёт сам объект Update (а не обёртку с .update)
+        u = getattr(e, 'update', e)
+        if not isinstance(u, types.UpdateDeleteMessages):
+            return
+        msg_ids = list(u.messages or [])
+        if not msg_ids:
+            return
+        # ВАЖНО: у UpdateDeleteMessages НЕТ поля peer — Telegram не сообщает,
+        # в каком чате удалили сообщение. Поэтому chat_id берём из своего кэша.
+        logger.info(f"[PM-DEL-RAW] UpdateDeleteMessages count={len(msg_ids)} ids={msg_ids}")
+        for msg_id in msg_ids:
+            old = db.get_pm_cached_by_msg(msg_id)
+            if not old:
+                logger.info(f"[PM-DEL-RAW] msg={msg_id} нет в кэше ЛС — пропуск (не ЛС или старое)")
+                continue
+            username = None
+            if old.get('sender_id'):
+                try:
+                    s = await client.get_entity(old['sender_id'])
+                    username = getattr(s, 'username', None)
+                except Exception:
+                    pass
+            await _enqueue_pm_delete(old.get('chat_id'), msg_id, old=old, username=username, source="raw")
+            await asyncio.sleep(0.01)
     except Exception as ex:
-        logger.debug(f"[PM-DEL-RAW] err: {ex}", exc_info=True)
-        pass
+        logger.warning(f"[PM-DEL-RAW] err: {ex}", exc_info=True)
 
 
 async def _pm_delete_worker():
     while True:
         try:
             item = await _pm_delete_queue.get()
-            chat_id = item['chat_id']
+            chat_id = item.get('chat_id')
             msg_id = item['msg_id']
+            if not chat_id:
+                logger.warning(f"[PM-DEL-WORKER] chat_id пустой для msg={msg_id} — пропуск")
+                continue
             logger.info(f"[PM-DEL-WORKER] Получено из очереди: chat={chat_id} msg_id={msg_id} size~{_pm_delete_queue.qsize()}")
 
             old = item.get('old')
@@ -170,6 +210,72 @@ async def ensure_pm_delete_worker():
         logger.info("[TASK] pm_delete_worker запущен (from handler)")
     else:
         logger.debug("[TASK] pm_delete_worker уже запущен")
+
+
+# ── Сверка кэша ЛС с реальными сообщениями ──
+# Telegram не всегда присылает апдейты об удалении (особенно в ЛС), поэтому
+# раз в N секунд проверяем по ID, какие сообщения из кэша ещё существуют.
+
+async def pm_presence_watcher(interval=45, max_age=259200, chats_per_cycle=20, ids_per_chat=100):
+    await asyncio.sleep(20)  # даём клиенту подняться
+    while True:
+        try:
+            chats = db.get_pm_chats_for_check(max_age=max_age, limit=chats_per_cycle)
+            for cid in chats:
+                if not cid:
+                    continue
+                try:
+                    rows = db.get_pm_rows_for_check(cid, max_age=max_age, limit=ids_per_chat)
+                    if not rows:
+                        continue
+                    ids = [int(r['msg_id']) for r in rows]
+                    try:
+                        msgs = await client.get_messages(cid, ids=ids)
+                    except FloodWaitError as fe:
+                        logger.warning(f"[PM-CHECK] FloodWait {fe.seconds}s — пауза")
+                        await asyncio.sleep(fe.seconds + 5)
+                        break
+                    except Exception as ex:
+                        logger.debug(f"[PM-CHECK] get_messages chat={cid}: {ex}")
+                        continue
+
+                    alive = []
+                    for row, m in zip(rows, msgs):
+                        exists = m is not None and not isinstance(m, types.MessageEmpty)
+                        if exists:
+                            alive.append(row['msg_id'])
+                            continue
+                        # сообщение отсутствует в чате
+                        if row.get('verified'):
+                            logger.info(
+                                f"[PM-CHECK] ПРОПАЛО: chat={cid} msg={row['msg_id']} "
+                                f"from={row.get('sender_name')} txt={(row.get('text') or '')[:30]!r}"
+                            )
+                            username = None
+                            if row.get('sender_id'):
+                                try:
+                                    s = await client.get_entity(row['sender_id'])
+                                    username = getattr(s, 'username', None)
+                                except Exception:
+                                    pass
+                            await _enqueue_pm_delete(
+                                cid, row['msg_id'], old=row, username=username, source="check"
+                            )
+                        else:
+                            # первая сверка (базовая линия) — тихо чистим
+                            try:
+                                db.delete_pm_cached(cid, row['msg_id'])
+                            except Exception:
+                                pass
+
+                    db.mark_pm_alive(cid, alive)
+                    await asyncio.sleep(1.2)
+                except Exception as ex:
+                    logger.debug(f"[PM-CHECK] chat={cid} err: {ex}")
+                    continue
+        except Exception as ex:
+            logger.warning(f"[PM-CHECK] loop err: {ex}")
+        await asyncio.sleep(interval)
 
 
 
@@ -1951,7 +2057,8 @@ async def check_email_cmd(e):
 @client.on(events.NewMessage(pattern=r'^!protect(?:\s+(on|off))?$', func=owner_filter))
 async def protect_cmd(e):
     global _protect_task
-    arg = e.pattern_match.group(1)
+    arg = e.pattern_match.group(1) if e.pattern_match else None
+    logger.info(f"[PROTECT] вход: sender={e.sender_id} text={repr((e.raw_text or '').strip())} cmd={arg}")
     if not arg:
         if _protect_task and not _protect_task.done():
             await respond(e, "🔒 **Защита ВКЛЮЧЕНА**\nИспользуй `!protect off` для отключения")
@@ -2153,6 +2260,7 @@ async def shadow_delete_msg(msg, delay=None):
     d = delay or state.shadow_delay or 5
     await asyncio.sleep(d)
     try:
+        suppress_pm_delete(getattr(msg, 'id', 0))
         await msg.delete()
     except Exception:
         pass
@@ -2239,15 +2347,10 @@ async def pm_edited_handler(e):
                     username = getattr(s, 'username', None)
                 except Exception:
                     pass
-            await ensure_pm_delete_worker()
-            logger.info(f"[PM-EDIT] Кладу в очередь (редакт в пустой): chat={e.chat_id} msg_id={e.id} has_old={bool(old)}")
-            await _pm_delete_queue.put({
-                'chat_id': e.chat_id,
-                'msg_id': e.id,
-                'old': old,
-                'username': username,
-                'event_sender_id': e.sender_id if e.sender_id else 0
-            })
+            await _enqueue_pm_delete(
+                e.chat_id, e.id, old=old, username=username,
+                event_sender_id=e.sender_id if e.sender_id else 0, source="edit-empty"
+            )
             return
 
         if old and (old['text'] or '') == (new_text or ''):
@@ -2522,7 +2625,17 @@ if __name__ == "__main__":
             logger.info("[TASK] pm_delete_worker запущен")
     except Exception as e:
         logger.warning(f"[TASK] pm_delete_worker не запущен: {e}")
-        # Принудительно подгружаем диалоги в память клиента, чтобы сервер присылал сырые апдейты
+
+    try:
+        # Базовая линия: первая сверка только фиксирует наличие сообщений,
+        # чтобы не завалить уведомлениями за время оффлайна
+        db.reset_pm_verified()
+        client.loop.create_task(pm_presence_watcher())
+        logger.info("[TASK] pm_presence_watcher запущен")
+    except Exception as e:
+        logger.warning(f"[TASK] pm_presence_watcher не запущен: {e}")
+
+    # Принудительно подгружаем диалоги в память клиента, чтобы сервер присылал сырые апдейты
     async def preload_dialogs():
         try:
             async for dialog in client.iter_dialogs(limit=50):
