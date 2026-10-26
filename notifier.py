@@ -84,12 +84,14 @@ class Notifier:
             logger.warning(f"[NOTIFY] {method}: {ex}")
             return None
 
-    async def send(self, text: str, preview: bool = False, buttons=None, business_connection_id=None):
+    async def send(self, text: str, preview: bool = False, buttons=None,
+                   business_connection_id=None, chat_id=None):
         if not self.enabled or not self.url or not self.chat_id:
             logger.warning(f"[NOTIFY] Не отправлено - disabled/enabled={self.enabled} url={bool(self.url)} chat_id={self.chat_id}")
             return False
+        target = chat_id if chat_id is not None else self.chat_id
         payload = {
-            "chat_id": self.chat_id,
+            "chat_id": target,
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": not preview,
@@ -100,7 +102,7 @@ class Notifier:
         markup = self._markup(buttons)
         if markup:
             payload["reply_markup"] = markup
-        logger.info(f"[NOTIFY] Отправка в {self.chat_id} (len={len(text)}, buttons={bool(buttons)})")
+        logger.info(f"[NOTIFY] Отправка в {target} (len={len(text)}, buttons={bool(buttons)})")
         data = await self._api('sendMessage', payload)
         ok = bool(data and data.get('ok'))
         if ok:
@@ -155,9 +157,10 @@ class Notifier:
             except Exception as ex:
                 logger.warning(f"[NOTIFY] on_business_connection: {ex}")
 
-    async def _process_updates(self, result, handler):
+    async def _process_updates(self, result, handler, message_handler=None):
         """Разбор батча getUpdates: business_connection → своё хранилище,
-        callback_query → handler. Возвращает новый offset."""
+        message → message_handler (ЛС владельца), callback_query → handler.
+        Возвращает новый offset."""
         offset = self._offset
         for upd in result or []:
             try:
@@ -167,6 +170,14 @@ class Notifier:
             bc = upd.get('business_connection')
             if bc:
                 await self._set_business_connection(bc)
+                continue
+            mq = upd.get('message')
+            if mq:
+                if message_handler:
+                    try:
+                        await message_handler(mq)
+                    except Exception as ex:
+                        logger.warning(f"[NOTIFY] message error: {ex}", exc_info=True)
                 continue
             cq = upd.get('callback_query')
             if not cq:
@@ -178,29 +189,30 @@ class Notifier:
         self._offset = offset
         return offset
 
-    async def poll_updates(self, handler, poll_timeout=50):
+    async def poll_updates(self, handler, message_handler=None, poll_timeout=50):
         """Long-poll getUpdates в процессе юзербота.
 
-        Принимает нажатия инлайн-кнопок внешнего бота и передаёт callback_query
-        в handler(q); параллельно слушает business_connection (Telegram Business),
-        чтобы id соединения было доступно для send/edit от имени аккаунта.
+        Принимает нажатия инлайн-кнопок (callback_query → handler), обычные
+        сообщения боту (message → message_handler, например меню по слову
+        владельца) и business_connection (id соединения для send/edit
+        от имени аккаунта).
         Работает только если этим токеном не опрашивает никто ещё.
         """
         if not self.enabled:
             logger.warning("[NOTIFY] Поллинг не запущен: NOTIFY_BOT_TOKEN/NOTIFY_CHAT_ID не заданы")
             return
-        logger.info("[NOTIFY] Поллинг внешнего бота запущен (callback_query, business_connection)")
+        logger.info("[NOTIFY] Поллинг внешнего бота запущен (callback_query, message, business_connection)")
         while True:
             data = await self._api(
                 'getUpdates',
                 {"timeout": poll_timeout, "offset": self._offset,
-                 "allowed_updates": ["callback_query", "business_connection"]},
+                 "allowed_updates": ["callback_query", "message", "business_connection"]},
                 timeout=poll_timeout + 10,
             )
             if data is None:
                 await asyncio.sleep(3)
                 continue
-            await self._process_updates(data.get('result'), handler)
+            await self._process_updates(data.get('result'), handler, message_handler)
 
     async def online_watch(self, username: str, target_id: int, sent_msg: str):
         if not NOTIFY_ONLINE_WATCH:

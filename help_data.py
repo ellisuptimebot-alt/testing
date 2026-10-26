@@ -10,7 +10,7 @@ CMD_DESCS = {
     'sleep':       {'desc': 'Включить автоответчик', 'syntax': '!sleep', 'example': '!sleep'},
     'wake':        {'desc': 'Выключить автоответчик', 'syntax': '!wake', 'example': '!wake'},
     'setreply':    {'desc': 'Установить текст ответа', 'syntax': '!setreply [@user|default] [текст]', 'example': '!setreply @username Привет'},
-    'menu':         {'desc': 'Интерактивное меню с кнопками во внешнем боте', 'syntax': '!menu', 'example': '!menu'},
+    'menu':         {'desc': 'Меню с кнопками в текущем чате (от имени аккаунта через Telegram Business)', 'syntax': '!menu', 'example': '!menu'},
     'status':      {'desc': 'Полный статус бота', 'syntax': '!status', 'example': '!status'},
     'time':        {'desc': 'Текущее время и дата', 'syntax': '!time', 'example': '!time'},
     'ping':        {'desc': 'Проверить задержку', 'syntax': '!ping', 'example': '!ping'},
@@ -174,7 +174,7 @@ HELP_CATS = {
         "`!wake` — выключить автоответчик\n"
         "`!setreply [@user | default] [текст]` — текст ответа\n"
         "`!status` — полный статус бота\n"
-        "`!menu` — меню с кнопками во внешнем боте\n"
+        "`!menu` — меню с кнопками в этом чате (от имени аккаунта, Telegram Business)\n"
         "`!time` — время и дата\n"
         "`!ping` — задержка соединения\n"
         "`!id` — ID чата / пользователя\n"
@@ -468,17 +468,6 @@ async def help_cmd(e):
         footer="`!help cmd <команда>` — описание одной команды\n`!help all` — все команды сразу",
     ))
     db.bump_stat('cmds')
-
-    # продублировать меню с кнопками в чат внешнего бота
-    if notify.enabled:
-        try:
-            teaser = ui.card("🎮 Меню с кнопками",
-                             "пульт и справка — интерактивно, прямо в этом чате",
-                             hint="или команда `!menu` в ЛС юзербота")
-            await notify.send(ui.to_html(teaser),
-                              buttons=[[_b("📚 Открыть меню", "h:back")]])
-        except Exception:
-            pass
 
 @client.on(events.NewMessage(pattern=r'!trhelp$', func=owner_filter))
 async def trhelp_cmd(e):

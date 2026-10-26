@@ -119,6 +119,17 @@ async def _enqueue_pm_delete(chat_id, msg_id, old=None, username=None, event_sen
     })
 
 
+# id владельца аккаунта (кэш, чтобы не дёргать get_me на каждое удаление)
+_me_id_cache = None
+
+
+async def _get_me_id():
+    global _me_id_cache
+    if _me_id_cache is None:
+        _me_id_cache = (await client.get_me()).id
+    return _me_id_cache
+
+
 @client.on(events.Raw)
 async def pm_delete_raw_update(e):
     try:
@@ -137,6 +148,20 @@ async def pm_delete_raw_update(e):
             if not old:
                 logger.info(f"[PM-DEL-RAW] msg={msg_id} нет в кэше ЛС — пропуск (не ЛС или старое)")
                 continue
+            # своё сообщение (исходящее) — уведомление не отправляем,
+            # но протухшую строку кэша убираем
+            if old.get('sender_id'):
+                try:
+                    _me = await _get_me_id()
+                except Exception:
+                    _me = None
+                if _me and old['sender_id'] == _me:
+                    logger.info(f"[PM-DEL-RAW] msg={msg_id} своё сообщение — пропуск")
+                    try:
+                        db.delete_pm_cached(old.get('chat_id'), msg_id)
+                    except Exception:
+                        pass
+                    continue
             username = None
             if old.get('sender_id'):
                 try:
@@ -2592,6 +2617,11 @@ async def pm_edited_handler(e):
     try:
         if not e.is_private:
             return
+        # Свои исходящие сообщения не оповещаем — фича следит за тем,
+        # что делает собеседник (правки/удаления в ЛС), а не за своими.
+        if getattr(e.message, 'out', False):
+            logger.info(f"[PM-EDIT] исходящее (своё) — пропуск msg={e.id}")
+            return
         new_text = e.message.text or e.message.message or ''
         old = db.get_pm_cached(e.chat_id, e.id)
         logger.info(f"[PM-EDIT] chat={e.chat_id} msg_id={e.id} new_empty={not new_text.strip()} has_old={bool(old)}")
@@ -2911,6 +2941,7 @@ async def handle_bot_callback(q):
     msg = q.get('message') or {}
     mid = msg.get('message_id')
     biz = msg.get('business_connection_id')
+    logger.info(f"[BOT-CB] нажатие: data={data!r} from={uid} msg={mid} biz={biz}")
 
     if uid != OWNER_ID:
         await notify.answer_callback(qid, "⛔ Нет доступа", alert=True)
@@ -2955,14 +2986,57 @@ async def handle_bot_callback(q):
 @client.on(events.NewMessage(pattern=r'!menu$', func=owner_filter))
 async def menu_cmd(e):
     text, buttons = help_data.menu_view()
-    sent = await notify.send(ui.to_html(text), buttons=buttons)
-    if sent:
-        await respond(e, ui.ok("Меню с кнопками отправлено в чат бота.", title="Меню",
-                               hint="Кнопки работают только в чате внешнего бота"))
+    html = ui.to_html(text)
+    target = e.chat_id
+    biz = notify.business_connection_id
+    same_chat = str(target) == str(notify.chat_id)
+    sent, via = False, None
+
+    # 1) Меню — прямо в тот чат, где набрана команда. В чужое ЛС бот сам
+    #    зайти не может, поэтому шлём от имени аккаунта (Telegram Business).
+    if biz and not same_chat:
+        sent = await notify.send(html, buttons=buttons,
+                                 business_connection_id=biz, chat_id=target)
+        via = 'business' if sent else None
+    # 2) Фолбэк: обычное сообщение бота в чат с ботом (или текущий, если это он)
+    if not sent:
+        sent = await notify.send(html, buttons=buttons)
+        via = 'bot' if sent else None
+
+    if via == 'business':
+        await respond(e, ui.ok("Меню отправлено в этот чат от имени аккаунта (Telegram Business).",
+                               title="Меню", hint="Кнопки кликабельны — жми прямо здесь"))
+    elif via == 'bot':
+        if same_chat:
+            await respond(e, ui.ok("Меню с кнопками отправлено.", title="Меню",
+                                   hint="Кнопки кликабельны"))
+        else:
+            await respond(e, ui.ok("Меню отправлено в чат внешнего бота.", title="Меню",
+                                   hint="Business-соединение неактивно или чат вне списка получателей — в этот чат бот зайти не может. Подключение: Настройки → Бизнес → Чатботы."))
     else:
-        await respond(e, ui.err("Не удалось отправить меню.\nПроверь `NOTIFY_BOT_TOKEN` и `NOTIFY_CHAT_ID`.",
+        await respond(e, ui.err("Не удалось отправить меню.\nПроверь `NOTIFY_BOT_TOKEN`, `NOTIFY_CHAT_ID` и бизнес-соединение.",
                                 title="Меню"))
     db.bump_stat('cmds')
+
+
+# ── Внешний бот: любое сообщение владельца в ЛС с ботом → меню с кнопками ──
+
+async def handle_bot_message(m):
+    """Приём обычных сообщений бота (message-апдейты в поллинге).
+    Меню приходит только когда владелец пишет боту в ЛС."""
+    try:
+        chat = m.get('chat') or {}
+        if chat.get('type') != 'private':
+            return
+        if (m.get('from') or {}).get('id') != OWNER_ID:
+            return
+        if not (m.get('text') or '').strip():
+            return
+        text, buttons = help_data.menu_view()
+        await notify.send(ui.to_html(text), buttons=buttons,
+                          chat_id=chat.get('id'))
+    except Exception as ex:
+        logger.warning(f"bot message handler: {ex}", exc_info=True)
 
 
 import help_data
@@ -3031,7 +3105,8 @@ if __name__ == "__main__":
 
     try:
         if notify.enabled:
-            client.loop.create_task(notify.poll_updates(handle_bot_callback))
+            client.loop.create_task(
+                notify.poll_updates(handle_bot_callback, message_handler=handle_bot_message))
             logger.info("[TASK] external_bot_poll запущен")
         else:
             logger.info("[TASK] external_bot_poll пропущен: NOTIFY_* не заданы")
