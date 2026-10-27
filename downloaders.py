@@ -12,15 +12,18 @@ import aiohttp
 import yt_dlp
 
 from config import MEDIA_DIR, logger, PROXY, PROXY_LIST
-from utils import format_bytes
+from utils import format_bytes, progress_bar
 import ui
 
 _proxy_list = list(PROXY_LIST)
 _single_proxy = PROXY
+_last_good_proxy = None   # рабочий прокси — ставим первым кандидатом
 
 
 def _proxy_candidates():
     proxies = [_p for _p in _proxy_list if _p] or ([_single_proxy] if _single_proxy else [])
+    if proxies and _last_good_proxy in proxies:
+        proxies = [_last_good_proxy] + [p for p in proxies if p != _last_good_proxy]
     if proxies:
         return proxies + [None]
     return [None]
@@ -35,11 +38,14 @@ def _with_proxy(opts, proxy):
 
 
 def _dl_rotate(sync_fn):
+    global _last_good_proxy
     last_ex = None
     for proxy in _proxy_candidates():
         label = proxy or 'прямое подключение'
         try:
-            return sync_fn(proxy)
+            result = sync_fn(proxy)
+            _last_good_proxy = proxy   # запоминаем победителя: следующий раз — первым
+            return result
         except Exception as ex:
             last_ex = ex
             logger.warning(f"Загрузка через {label} не удалась: {ex}")
@@ -194,6 +200,78 @@ def set_max_file_size(mb: int):
     _max_file_size = mb
 
 
+# ── Прогресс скачивания: хук yt-dlp (из потока) + async-репортёр в статус-сообщение ──
+
+class _DownloadProgress:
+    def __init__(self):
+        self.percent = 0.0
+        self.speed = ''
+        self.eta = ''
+        self.updated = time.time()
+        self.active = True
+
+    def hook(self, d):
+        """progress_hook yt-dlp — вызывается из рабочего потока."""
+        st = d.get('status')
+        if st == 'downloading':
+            total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+            done = d.get('downloaded_bytes') or 0
+            if total:
+                self.percent = min(100.0, done * 100.0 / total)
+            self.speed = (d.get('_speed_str') or '').strip()
+            self.eta = (d.get('_eta_str') or '').strip()
+        elif st == 'finished':
+            self.percent = 100.0
+            self.speed = ''
+            self.eta = ''
+        self.updated = time.time()
+
+    def stop(self):
+        self.active = False
+
+
+_current_progress = None   # активный прогресс (читается при создании YoutubeDL)
+
+
+class _ProgressYDL(yt_dlp.YoutubeDL):
+    """YoutubeDL с хуком текущего прогресса — глобальная замена yt_dlp.YoutubeDL,
+    чтобы проценты шли из всех путей (YouTube, generic, TikTok, Instagram…)."""
+
+    def __init__(self, opts=None, *args, **kwargs):
+        o = dict(opts or {})
+        prog = _current_progress
+        if prog is not None:
+            hooks = list(o.get('progress_hooks') or [])
+            hooks.append(prog.hook)
+            o['progress_hooks'] = hooks
+        super().__init__(o, *args, **kwargs)
+
+
+yt_dlp.YoutubeDL = _ProgressYDL
+
+
+async def _report_progress(prog, edit_fn, label="📥 Скачиваю:"):
+    """Рисует `[бар] N%  ⚡скорость ⏳ETA` в статус-сообщение раз в ~2.5с."""
+    last_shown = -1.0
+    while prog.active:
+        await asyncio.sleep(2.5)
+        if not prog.active:
+            break
+        if time.time() - prog.updated > 15:
+            continue   # yt-dlp молчит (постобработка/слияние) — не мешаем
+        p = prog.percent
+        if p < 1 or p == last_shown:
+            continue
+        last_shown = p
+        bar = progress_bar(p, 100, 10)
+        tail = f" ⚡{prog.speed}" if prog.speed else ''
+        tail += f" ⏳{prog.eta}" if prog.eta else ''
+        try:
+            await edit_fn(f"{label} [{bar}] **{p:.0f}%**{tail}")
+        except Exception:
+            pass
+
+
 _INVIDIOUS_INSTANCES = [
     'inv.nadeko.net',
     'yewtu.be',
@@ -225,8 +303,12 @@ async def _try_invidious(url, mode):
             combined = data.get('formatStreams') or []
             adaptive = data.get('adaptiveFormats') or []
             if mode == 'audio':
-                picks = adaptive + combined
-                best = max((f for f in picks if f.get('url') and (f.get('bitrate') or 0)), key=lambda f: f['bitrate'], default=None)
+                # Только аудио-дорожки: video-only adaptive-форматы имеют
+                # больший bitrate, иначе max() вернул бы видео вместо аудио
+                audio_picks = [f for f in adaptive
+                               if str(f.get('type') or '').lower().startswith('audio')]
+                best = max((f for f in audio_picks if f.get('url') and (f.get('bitrate') or 0)),
+                           key=lambda f: f['bitrate'], default=None)
             else:
                 best = max((f for f in combined if f.get('url') and (f.get('height') or 0)), key=lambda f: f['height'], default=None)
                 if not best and adaptive:
@@ -304,21 +386,24 @@ def _dl_diag(url):
         logger.error(f"yt-dlp CLI diag failed: {ex}")
 
 
-def _cli_download(url, output_path):
+def _cli_download(url, output_path, is_audio=False):
     cmd = [
         sys.executable, '-m', 'yt_dlp',
         '-o', output_path,
         '--no-playlist',
         '--no-check-certificates',
-        url,
     ]
+    if is_audio:
+        # Без -f CLI скачал бы дефолтное видео; m4a предпочитаем — Telegram
+        # отправляет её как аудио (webm по mime video/webm показывается как видео)
+        cmd += ['-f', 'bestaudio[ext=m4a]/bestaudio']
+    cmd.append(url)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode == 0:
             matches = sorted(glob.glob(output_path.replace('%(ext)s', '*')), key=os.path.getmtime, reverse=True)
             if matches:
                 return matches[0]
-            stderr_lower = result.stderr.lower()
             m = re.search(r'\[download\]\s+(.+?)\s+has already been downloaded', result.stderr, re.IGNORECASE)
             if m:
                 return m.group(1).strip()
@@ -393,9 +478,10 @@ def _download_with_opts(url, opts, quality, is_audio):
         probe = _probe_formats(url, opts)
         if probe is None:
             logger.warning("Python API probe failed, trying CLI fallback...")
-            ext = 'mp3' if is_audio else 'mp4'
-            cli_path = os.path.join(MEDIA_DIR, f'%(id)s.{ext}')
-            cli_result = _cli_download(url, cli_path)
+            # %(ext)s, а не жёсткий ext: литерал '.mp3' в outtmpl давал
+            # видеофайл с именем .mp3
+            cli_path = os.path.join(MEDIA_DIR, '%(id)s.%(ext)s')
+            cli_result = _cli_download(url, cli_path, is_audio=is_audio)
             if cli_result:
                 return cli_result
             if not _JS_RUNTIMES:
@@ -416,7 +502,7 @@ def _download_with_opts(url, opts, quality, is_audio):
         opts['postprocessors'] = [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '192',
+            'preferredquality': str(quality or 192),
         }]
     elif _HAS_FFMPEG and not is_audio:
         opts['format'] = 'bv*+ba/b'
@@ -424,7 +510,10 @@ def _download_with_opts(url, opts, quality, is_audio):
             opts['format'] = f'bv*[height<={quality}]+ba/b[height<={quality}]'
         opts['merge_output_format'] = 'mp4'
     else:
-        formats_to_try = ['ba', 'b'] if is_audio else ['b', 'bv']
+        # Аудио без ffmpeg: только аудио-потоки, БЕЗ отката на 'b' (best = видео) —
+        # иначе вместо аудио молча уходит видео. m4a предпочтительнее: webm/opus
+        # Telegram по mime video/webm показывает как видео.
+        formats_to_try = ['bestaudio[ext=m4a]/bestaudio'] if is_audio else ['b', 'bv']
         last_ex = None
         for fmt in formats_to_try:
             opts['format'] = fmt
@@ -436,6 +525,11 @@ def _download_with_opts(url, opts, quality, is_audio):
             except yt_dlp.utils.DownloadError as ex:
                 last_ex = ex
                 continue
+        if is_audio:
+            raise ValueError(
+                f"YouTube: аудио-поток недоступен ({last_ex}). "
+                "Установи ffmpeg — тогда аудио качается любым форматом и конвертируется в mp3."
+            )
         raise ValueError(f"YouTube: {last_ex}")
 
     logger.info(f'yt-dlp opts: format={opts.get("format")}, ffmpeg={_HAS_FFMPEG}')
@@ -459,10 +553,10 @@ async def _download_yt_video(url, quality=None):
     return await asyncio.to_thread(_dl_rotate, _dl)
 
 
-async def _download_yt_audio(url):
+async def _download_yt_audio(url, bitrate=None):
     def _dl(proxy=None):
         try:
-            return _pick_format_and_download(url, _with_proxy(dict(_YT_DL_OPTS), proxy), quality=None, is_audio=True)
+            return _pick_format_and_download(url, _with_proxy(dict(_YT_DL_OPTS), proxy), quality=bitrate, is_audio=True)
         except yt_dlp.utils.DownloadError as ex:
             raise ValueError(f"YouTube: {ex}")
         except ValueError:
@@ -687,14 +781,20 @@ async def _download_generic(url, mode, event_edit_func):
                 opts['format'] = 'ba/b'
                 opts['postprocessors'] = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}]
             else:
-                opts['format'] = 'ba'
-        filename = await asyncio.to_thread(lambda: _dl_generic_sync(url, opts))
+                # без ffmpeg оставляем аудио в исходном контейнере, но m4a
+                # предпочтительнее: webm Telegram показывает как видео
+                opts['format'] = 'bestaudio[ext=m4a]/bestaudio'
+        filename = await asyncio.to_thread(
+            lambda: _dl_generic_sync(url, opts, is_audio=(mode == 'audio')))
         if filename:
             return filename
     except Exception as ex:
         logger.warning(f"yt-dlp generic failed: {ex}")
 
-    if _is_direct_media(url):
+    # В audio-режиме прямую ссылку качаем только если это аудиоформат:
+    # видео-контейнер без конвертации — это уже не аудио
+    _direct_is_audio = bool(re.search(r'\.(mp3|aac|m4a|ogg|wav|flac)($|\?)', url.lower()))
+    if _is_direct_media(url) and (mode != 'audio' or _direct_is_audio):
         await event_edit_func("📥 Скачиваю напрямую...")
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as s:
@@ -712,6 +812,16 @@ async def _download_generic(url, mode, event_edit_func):
                             return path
         except Exception as ex:
             logger.warning(f"Direct download failed: {ex}")
+
+    if mode == 'audio':
+        # Фолбэки ниже (картинка, m3u8) возвращают не-аудио — вместо них честная ошибка
+        raise ValueError(
+            "Не удалось получить аудио по этой ссылке. "
+            + ("Проверь ссылку или используй YouTube-адрес."
+               if _HAS_FFMPEG else
+               "Без ffmpeg аудио из видео не извлекается: установи ffmpeg "
+               "(winget install ffmpeg / apt install ffmpeg).")
+        )
 
     await event_edit_func("🖼 Пробую скачать как картинку...")
     try:
@@ -753,14 +863,16 @@ async def _download_generic(url, mode, event_edit_func):
     return None
 
 
-def _dl_generic_sync(url, opts):
+def _dl_generic_sync(url, opts, is_audio=False):
     last_ex = None
-    for fmt_override in [None, 'b', 'best']:
+    # Формат из opts ('ba' для аудио) НЕ затираем дефолтным: раньше первая
+    # итерация делала del opts['format'] и yt-dlp качал лучшее видео.
+    # Для аудио видео-фолбэки ('b'/'best') запрещены.
+    attempts = [None] if is_audio else [None, 'b', 'best']
+    for fmt_override in attempts:
         try:
             if fmt_override:
                 opts['format'] = fmt_override
-            elif 'format' in opts:
-                del opts['format']
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 filepath = None
@@ -782,7 +894,7 @@ def _dl_generic_sync(url, opts):
             raise
     last_ex_str = str(last_ex) if last_ex else ''
 
-    if 'No video formats' in last_ex_str:
+    if not is_audio and 'No video formats' in last_ex_str:
         try:
             with yt_dlp.YoutubeDL({**opts, 'skip_download': True, 'quiet': True, 'no_warnings': True, 'format': None}) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -909,12 +1021,54 @@ async def _generic_direct_download(url, *, referer='https://www.pinterest.com/',
     raise ValueError("Файл пуст после скачивания")
 
 
-_DL_LOCK = asyncio.Lock()
+# ── Очередь загрузок: лок на платформу (разные платформы качаются параллельно,
+#    две загрузки с одной платформы — последовательно) + позиция в очереди ──
+_DL_LOCKS = {}
+_dl_waiting = 0
+
+
+def _platform_key(url):
+    u = url.lower()
+    if 'youtube.com' in u or 'youtu.be' in u:
+        return 'youtube'
+    if 'tiktok.com' in u:
+        return 'tiktok'
+    if 'instagram.com' in u:
+        return 'instagram'
+    if 'pinterest.com' in u or 'pin.it' in u:
+        return 'pinterest'
+    return 'generic'
 
 
 async def run_download(event_edit_func, url, mode='video', quality=None, timeout=600):
-    async with _DL_LOCK:
-        return await _run_download_impl(event_edit_func, url, mode, quality, timeout)
+    global _dl_waiting, _current_progress
+    _dl_waiting += 1
+    pos = _dl_waiting
+    lock = _DL_LOCKS.setdefault(_platform_key(url), asyncio.Lock())
+    prog = _DownloadProgress()
+    reporter = None
+    try:
+        if lock.locked():
+            try:
+                await event_edit_func(f"⏳ Очередь загрузок: **позиция {pos}**\n"
+                                      "Дождусь своей очереди…")
+            except Exception:
+                pass
+        async with lock:
+            if pos > 1:
+                try:
+                    await event_edit_func("▶️ Очередь пройдена — скачиваю…")
+                except Exception:
+                    pass
+            _current_progress = prog
+            reporter = asyncio.create_task(_report_progress(prog, event_edit_func))
+            return await _run_download_impl(event_edit_func, url, mode, quality, timeout)
+    finally:
+        prog.stop()
+        if reporter is not None:
+            reporter.cancel()
+        _current_progress = None
+        _dl_waiting -= 1
 
 
 async def _run_download_impl(event_edit_func, url, mode='video', quality=None, timeout=600):
@@ -928,6 +1082,12 @@ async def _run_download_impl(event_edit_func, url, mode='video', quality=None, t
             m = re.match(r'(https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)[a-zA-Z0-9_-]{11})', url)
             if m:
                 url = m.group(1)
+
+        if mode == 'audio' and (is_tiktok or is_instagram or is_pinterest):
+            raise ValueError(
+                "!audio поддерживается только для YouTube и прямых ссылок; "
+                "для TikTok / Instagram / Pinterest сначала скачай видео через !dl."
+            )
 
         if is_pinterest:
             await event_edit_func("📥 Скачиваю из Pinterest...")
@@ -948,7 +1108,7 @@ async def _run_download_impl(event_edit_func, url, mode='video', quality=None, t
             if mode == 'audio':
                 await event_edit_func("🎵 Скачиваю аудио...")
                 filename = await asyncio.wait_for(
-                    _download_yt_audio(url), timeout=timeout
+                    _download_yt_audio(url, quality), timeout=timeout
                 )
             else:
                 qual = f"{quality}p" if quality else None
@@ -1000,13 +1160,19 @@ async def _run_download_impl(event_edit_func, url, mode='video', quality=None, t
         return None
 
 
-async def send_and_clean(event_edit_func, client, chat_id, filepath, caption=''):
+async def send_and_clean(event_edit_func, client, chat_id, filepath, caption='',
+                         as_voice=False, as_document=False):
     if not filepath:
         return
     files = filepath if isinstance(filepath, list) else [filepath]
     files = [f for f in files if f and os.path.exists(f)]
     if not files:
         return
+    send_kwargs = {}
+    if as_voice:
+        send_kwargs['voice_note'] = True   # отправка голосовым (аудио-сообщением)
+    elif as_document:
+        send_kwargs['force_document'] = True  # всегда файлом, без плеера
     try:
         too_big = [f for f in files if os.path.getsize(f) / 1024 / 1024 > _max_file_size]
     except OSError:
@@ -1024,7 +1190,7 @@ async def send_and_clean(event_edit_func, client, chat_id, filepath, caption='')
             except OSError:
                 logger.warning(f"send file: {f} (размер недоступен)")
             try:
-                await client.send_file(chat_id, f, caption=caption)
+                await client.send_file(chat_id, f, caption=caption, **send_kwargs)
                 sent.append(f)
             except Exception as ex:
                 logger.warning(f"send as media failed ({f}): {ex}")

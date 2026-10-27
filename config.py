@@ -25,7 +25,11 @@ PROXY = os.environ.get('PROXY')
 PROXY_LIST = [p.strip() for p in os.environ.get('PROXY_LIST', '').split(',') if p.strip()]
 
 MAX_COOLDOWN_ENTRIES = 500
-MAX_FILE_SIZE_MB = 1500
+# Лимит отправки: для user-аккаунтов Telegram — до 4 ГБ
+MAX_FILE_SIZE_MB = int(os.environ.get('MAX_FILE_SIZE_MB', '4096'))
+
+# Язык ответов бота: ru (по умолчанию) | en — см. helpers.t()
+BOT_LANG = (os.environ.get('BOT_LANG') or 'ru').strip().lower()
 
 # ===== EXTERNAL NOTIFY BOT =====
 NOTIFY_BOT_TOKEN = os.environ.get('NOTIFY_BOT_TOKEN')

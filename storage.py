@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 _VALID_TABLES = frozenset({
     'bot_state', 'saved_data', 'notes', 'todos', 'stats',
     'reply_settings', 'sessions', 'protected_chats',
-    'online_watch', 'pm_msg_cache',
+    'online_watch', 'pm_msg_cache', 'reminders',
 })
 
 
@@ -73,6 +73,12 @@ class Storage:
                     verified INTEGER DEFAULT 1,
                     last_seen INTEGER DEFAULT 0,
                     PRIMARY KEY(chat_id, msg_id)
+                );
+                CREATE TABLE IF NOT EXISTS reminders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    due_at INTEGER NOT NULL
                 );
             ''')
             # Миграция для существующих баз: добавляем отсутствующие колонки
@@ -204,6 +210,35 @@ class Storage:
     def del_todo(self, tid):
         with self.lock:
             self.conn.execute('DELETE FROM todos WHERE id = ?', (tid,))
+            self.conn.commit()
+
+    # ── Напоминания (!remind) — персистентные, переживают рестарт ──
+
+    def add_reminder(self, chat_id, text, due_at):
+        with self.lock:
+            cur = self.conn.execute(
+                'INSERT INTO reminders (chat_id, text, due_at) VALUES (?, ?, ?)',
+                (int(chat_id), text, int(due_at))
+            )
+            self.conn.commit()
+            return cur.lastrowid
+
+    def get_due_reminders(self, now):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute('SELECT id, chat_id, text, due_at FROM reminders WHERE due_at <= ? ORDER BY due_at',
+                        (int(now),))
+            return [dict(row) for row in cur.fetchall()]
+
+    def get_pending_reminders(self):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute('SELECT id, chat_id, text, due_at FROM reminders ORDER BY due_at')
+            return [dict(row) for row in cur.fetchall()]
+
+    def del_reminder(self, rid):
+        with self.lock:
+            self.conn.execute('DELETE FROM reminders WHERE id = ?', (int(rid),))
             self.conn.commit()
 
     # ── Stats ──

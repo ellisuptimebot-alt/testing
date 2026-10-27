@@ -51,10 +51,11 @@ CMD_DESCS = {
     'choose':       {'desc': 'Случайный выбор', 'syntax': '!choose [вар1, вар2]', 'example': '!choose пицца, суши'},
     'quiz':         {'desc': 'Викторина', 'syntax': '!quiz', 'example': '!quiz'},
     'ytshow':       {'desc': 'Скачать видео с YouTube', 'syntax': '!ytshow <URL> [качество]', 'example': '!ytshow https://youtu.be/... 720'},
-    'dl':           {'desc': 'Скачать видео (YouTube / Instagram / TikTok)', 'syntax': '!dl <URL>', 'example': '!dl https://www.tiktok.com/@user/video/...'},
+    'dl':           {'desc': 'Скачать видео (YouTube / Instagram / TikTok)', 'syntax': '!dl <URL> | !dl (ответом на ссылку)', 'example': '!dl https://www.tiktok.com/@user/video/...'},
     'playlist':     {'desc': 'Скачать плейлист YouTube', 'syntax': '!playlist <URL> [кол-во] | [start-end]', 'example': '!playlist https://youtube.com/playlist?list=... 5'},
-    'audio':        {'desc': 'Скачать аудио с YouTube', 'syntax': '!audio <URL>', 'example': '!audio https://youtu.be/...'},
+    'audio':        {'desc': 'Скачать аудио с YouTube', 'syntax': '!audio <URL> [128|192|320] [voice|file]', 'example': '!audio https://youtu.be/... 192 voice'},
     'sub':          {'desc': 'Скачать субтитры с YouTube', 'syntax': '!sub <URL> [язык]', 'example': '!sub https://youtu.be/... ru'},
+    'ytupdate':     {'desc': 'Обновить yt-dlp вручную', 'syntax': '!ytupdate', 'example': '!ytupdate'},
     'calc':         {'desc': 'Калькулятор', 'syntax': '!calc [выражение]', 'example': '!calc 2+2*2'},
     'remind':       {'desc': 'Напоминание', 'syntax': '!remind [сек] [текст]', 'example': '!remind 60 Поставить чайник'},
     'search':       {'desc': 'Поиск в Wikipedia', 'syntax': '!search [запрос]', 'example': '!search Python'},
@@ -133,7 +134,7 @@ COMMANDS_LIST = {
         '!coin', '!rand', '!8ball', '!rps', '!slot', '!lucky', '!choose', '!quiz'
     ],
     'youtube': [
-        '!ytshow', '!dl', '!playlist', '!audio', '!sub'
+        '!ytshow', '!dl', '!playlist', '!audio', '!sub', '!ytupdate'
     ],
     'утилиты': [
         '!calc', '!remind', '!search', '!shorten', '!weather', '!translate', '!trhelp',
@@ -221,10 +222,11 @@ HELP_CATS = {
     'youtube': (
         "🎬 **ЗАГРУЗКА МЕДИА**\n\n"
         "`!ytshow <URL> [качество]` — скачать видео с YouTube\n"
-        "`!dl <URL>` — скачать видео (YouTube / Instagram / TikTok)\n"
+        "`!dl <URL>` — скачать видео (YouTube / Instagram / TikTok), можно ответом на ссылку\n"
         "`!playlist <URL> [кол-во | start-end]` — загрузка плейлиста YouTube\n"
-        "`!audio <URL>` — скачать аудио с YouTube\n"
-        "`!sub <URL> [ru|en]` — скачать субтитры с YouTube\n\n"
+        "`!audio <URL> [128|192|320] [voice|file]` — аудио (битрейт, голосовое/документ)\n"
+        "`!sub <URL> [ru|en]` — скачать субтитры с YouTube\n"
+        "`!ytupdate` — обновить yt-dlp, если YouTube сломал скачивание\n\n"
         "💡 Таймаут — 10 мин."
     ),
     'утилиты': (

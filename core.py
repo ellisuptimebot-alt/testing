@@ -163,9 +163,11 @@ class BotState:
 
 
 state = BotState()
+# Единый источник общего состояния для main.py (тут — единственные определения):
+# кулдауны команд/ответов, лок загрузки и хэндлеры фоновых задач.
 command_cooldown = defaultdict(float)
 reply_cooldown = {}
-_download_lock = None
+_download_lock = asyncio.Lock()
 _watch_task = None
 _protect_task = None
 

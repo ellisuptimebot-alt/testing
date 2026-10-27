@@ -89,6 +89,13 @@ def _eval_ast(node):
         if isinstance(node.value, (int, float)):
             return node.value
         raise SafeEvalError(f"Недопустимая константа: {type(node.value).__name__}")
+    if isinstance(node, ast.Name):
+        # константы белого списка (pi, e): функции из _SAFE_FUNCS допустимы
+        # только в вызове sqrt(...), отдельным именем — нет
+        value = _SAFE_FUNCS.get(node.id)
+        if value is not None and not callable(value):
+            return value
+        raise SafeEvalError(f"Недопустимое имя: {node.id}")
     if isinstance(node, ast.BinOp):
         op_type = type(node.op)
         if op_type not in _SAFE_OPS:
