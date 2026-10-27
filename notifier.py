@@ -58,6 +58,7 @@ class Notifier:
         disp = (name or '').strip()
         if not disp:
             disp = 'пользователь'
+        disp = _escape(disp)  # имя может содержать < & — ломало parse_mode
 
         if uid_int:
             return f'<a href="tg://user?id={uid_int}">{disp}</a> [<code>{uid_int}</code>]'
@@ -144,6 +145,11 @@ class Notifier:
             logger.warning(f"[NOTIFY] sendDocument: {ex}")
             return False
 
+    @staticmethod
+    def _cap(s: str, limit: int) -> str:
+        """Усечение текста с многоточием (лимит sendMessage — 4096)."""
+        return s if len(s) <= limit else s[:limit - 1] + '…'
+
     async def send(self, text: str, preview: bool = False, buttons=None,
                    business_connection_id=None, chat_id=None):
         if not self.enabled or not self.url or not self.chat_id:
@@ -163,11 +169,28 @@ class Notifier:
         if markup:
             payload["reply_markup"] = markup
         logger.info(f"[NOTIFY] Отправка в {target} (len={len(text)}, buttons={bool(buttons)})")
-        data = await self._api('sendMessage', payload)
-        ok = bool(data and data.get('ok'))
-        if ok:
-            logger.info(f"[NOTIFY] Успешно отправлено")
-        return ok
+        # Ретраи: временный сетевой сбой/5xx/429 не должны терять уведомление
+        # (в пакетном удалении одно падение = одно потерянное уведомление).
+        data = None
+        for attempt in range(3):
+            data = await self._api('sendMessage', payload)
+            if data and data.get('ok'):
+                logger.info(f"[NOTIFY] Успешно отправлено")
+                return True
+            desc = str((data or {}).get('description') or '')
+            if 'Bad Request' in desc:
+                # семантическая ошибка (разметка/лимиты) — повтор не поможет
+                logger.warning(f"[NOTIFY] sendMessage отклонён: {desc[:200]}")
+                return False
+            if attempt < 2:
+                retry_after = 0
+                try:
+                    retry_after = int(((data or {}).get('parameters') or {}).get('retry_after') or 0)
+                except Exception:
+                    retry_after = 0
+                await asyncio.sleep(retry_after or (0.5 + 1.0 * attempt))
+        logger.warning(f"[NOTIFY] sendMessage не удался после 3 попыток: {str(data)[:200]}")
+        return False
 
     async def edit(self, message_id: int, text: str, buttons=None, preview: bool = False,
                    business_connection_id=None, chat_id=None):
@@ -285,7 +308,7 @@ class Notifier:
             f"👤 Пользователь: {user_str}\n"
             f"🟢 Статус: <b>появился в сети</b>\n\n"
             f"✉️ <b>Сообщение отправлено таргету:</b>\n"
-            f"<blockquote>{sent_msg}</blockquote>"
+            f"<blockquote>{_escape(self._cap(sent_msg or '', 3000))}</blockquote>"
         )
         await self.send(msg)
 
@@ -303,10 +326,12 @@ class Notifier:
 
     async def pm_deleted(self, chat_id: int, sender_id: int, sender_name: str, text: str, has_media: bool, media_type: str, username: str = None, cached: bool = True, media_file: str = None):
         if not NOTIFY_PM_DELETE:
-            return
+            return False
         label = self._MEDIA_LABELS.get(media_type or '', 'Медиа')
         if text and text.strip():
-            body = text.strip()
+            # экранируем: текст сообщения с '<' или '&' иначе ломает parse_mode
+            # и Bot API отвечает 400 — уведомление терялось
+            body = self._cap(_escape(text.strip()), 3500)
         elif not cached:
             # строки в кэше не было вовсе — сообщение пришло до старта бота
             body = "Сообщение не найдено в кэше юзербота. Вероятно, оно было отправлено до запуска бота или уже не закэшировано."
@@ -333,7 +358,7 @@ class Notifier:
                     return True
             except Exception as ex:
                 logger.warning(f"[NOTIFY] pm_deleted media: {ex}")
-        await self.send(msg)
+        return await self.send(msg)
 
     async def pm_media(self, chat_id, old, path, note):
         """Пересылка медиа (фото/видео) через внешнего бота с подписью:
@@ -354,7 +379,7 @@ class Notifier:
             f"📎 Тип: {label}",
         ]
         if text:
-            parts.append(f"<b>Подпись:</b>\n<blockquote>{_escape(text)}</blockquote>")
+            parts.append(f"<b>Подпись:</b>\n<blockquote>{_escape(self._cap(text, 700))}</blockquote>")
         caption = "\n".join(parts)
         if not path or not os.path.isfile(path):
             return False  # файла нет — вызывающий код сообщит об этом сам
@@ -364,11 +389,11 @@ class Notifier:
         if not NOTIFY_PM_EDIT:
             return
         if old_text and old_text.strip():
-            old = old_text.strip()
+            old = self._cap(_escape(old_text.strip()), 1700)
         else:
             old = "Сообщение не найдено в кэше юзербота. Редактирование зафиксировано, но изначальный текст неизвестен."
         if new_text and new_text.strip():
-            new = new_text.strip()
+            new = self._cap(_escape(new_text.strip()), 1700)
         else:
             new = "(пусто)"
         user_str = self._format_user(sender_id, username=username, name=sender_name)
@@ -386,10 +411,10 @@ class Notifier:
             return
         msg = (
             f"🔐 <b>НОВАЯ СЕССИЯ</b>\n\n"
-            f"📱 Устройство: <b>{device}</b>\n"
-            f"💻 Платформа: <b>{platform}</b>\n"
-            f"🌐 IP: <code>{ip}</code>\n"
-            f"🕒 Дата: <code>{date}</code>"
+            f"📱 Устройство: <b>{_escape(device)}</b>\n"
+            f"💻 Платформа: <b>{_escape(platform)}</b>\n"
+            f"🌐 IP: <code>{_escape(ip)}</code>\n"
+            f"🕒 Дата: <code>{_escape(date)}</code>"
         )
         await self.send(msg)
 
@@ -412,8 +437,8 @@ class Notifier:
             det = det[:1000] + "..."
         msg = (
             f"⚠️ <b>ОШИБКА ЮЗЕРБОТА</b>\n\n"
-            f"📌 {title}\n\n"
-            f"<code>{det}</code>"
+            f"📌 {_escape(title)}\n\n"
+            f"<code>{_escape(det)}</code>"
         )
         await self.send(msg)
 

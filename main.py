@@ -218,35 +218,44 @@ async def pm_delete_raw_update(e):
         # ВАЖНО: у UpdateDeleteMessages НЕТ поля peer — Telegram не сообщает,
         # в каком чате удалили сообщение. Поэтому chat_id берём из своего кэша.
         logger.info(f"[PM-DEL-RAW] UpdateDeleteMessages count={len(msg_ids)} ids={msg_ids}")
+        user_cache = {}  # sender_id → username: один GetUsers на отправителя в пакете
         for msg_id in msg_ids:
-            old = db.get_pm_cached_by_msg(msg_id)
-            if not old:
-                logger.info(f"[PM-DEL-RAW] msg={msg_id} нет в кэше ЛС — пропуск (не ЛС или старое)")
+            try:
+                old = db.get_pm_cached_by_msg(msg_id)
+                if not old:
+                    logger.info(f"[PM-DEL-RAW] msg={msg_id} нет в кэше ЛС — пропуск (не ЛС или старое)")
+                    continue
+                # своё сообщение (исходящее) — уведомление об удалении не отправляем,
+                # но если это было фото/видео — сохраняем копию через внешнего бота
+                if old.get('sender_id') and await _is_own_message(old['sender_id']):
+                    logger.info(f"[PM-DEL-RAW] msg={msg_id} своё сообщение — пропуск")
+                    if old.get('has_media'):
+                        await _restore_media_to_notify(
+                            old, old.get('chat_id'), msg_id,
+                            "🗑 <b>Твоё сообщение удалено</b> (медиа сохранено)"
+                        )
+                    _delete_media_file(old.get('media_file'))
+                    try:
+                        db.delete_pm_cached(old.get('chat_id'), msg_id)
+                    except Exception:
+                        pass
+                    continue
+                sid = old.get('sender_id')
+                username = None
+                if sid:
+                    if sid not in user_cache:
+                        try:
+                            s = await client.get_entity(sid)
+                            user_cache[sid] = getattr(s, 'username', None) or ''
+                        except Exception:
+                            user_cache[sid] = ''
+                    username = user_cache[sid] or None
+                await _enqueue_pm_delete(old.get('chat_id'), msg_id, old=old, username=username, source="raw")
+                await asyncio.sleep(0.01)
+            except Exception as item_ex:
+                # ошибка одного сообщения не должна обрывать остальные в пакете
+                logger.warning(f"[PM-DEL-RAW] msg={msg_id} err: {item_ex}", exc_info=True)
                 continue
-            # своё сообщение (исходящее) — уведомление об удалении не отправляем,
-            # но если это было фото/видео — сохраняем копию через внешнего бота
-            if old.get('sender_id') and await _is_own_message(old['sender_id']):
-                logger.info(f"[PM-DEL-RAW] msg={msg_id} своё сообщение — пропуск")
-                if old.get('has_media'):
-                    await _restore_media_to_notify(
-                        old, old.get('chat_id'), msg_id,
-                        "🗑 <b>Твоё сообщение удалено</b> (медиа сохранено)"
-                    )
-                _delete_media_file(old.get('media_file'))
-                try:
-                    db.delete_pm_cached(old.get('chat_id'), msg_id)
-                except Exception:
-                    pass
-                continue
-            username = None
-            if old.get('sender_id'):
-                try:
-                    s = await client.get_entity(old['sender_id'])
-                    username = getattr(s, 'username', None)
-                except Exception:
-                    pass
-            await _enqueue_pm_delete(old.get('chat_id'), msg_id, old=old, username=username, source="raw")
-            await asyncio.sleep(0.01)
     except Exception as ex:
         logger.warning(f"[PM-DEL-RAW] err: {ex}", exc_info=True)
 
