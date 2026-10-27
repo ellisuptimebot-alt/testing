@@ -16,6 +16,7 @@ from flask import Flask
 from PIL import Image, ImageDraw
 
 from telethon import events
+from telethon import utils as tgutils
 from telethon.errors import FloodWaitError, MessageNotModifiedError
 from client import client
 from telethon.tl.functions.account import (
@@ -2683,6 +2684,95 @@ async def pm_edited_handler(e):
 
 # ── Online watch ──
 
+_watch_err_logged = set()
+_watch_count_logged = None
+
+
+def _status_name(status):
+    """Ключ статуса: online / offline / recently / last_week / ... / unknown."""
+    if isinstance(status, UserStatusOnline):
+        return 'online'
+    if isinstance(status, UserStatusOffline):
+        return 'offline'
+    if isinstance(status, UserStatusRecently):
+        return 'recently'
+    if isinstance(status, UserStatusLastWeek):
+        return 'last_week'
+    if isinstance(status, UserStatusLastMonth):
+        return 'last_month'
+    return 'unknown'
+
+
+def _profile_name(ent=None, username=None):
+    """Имя профиля (без markdown-символов), иначе @username, иначе ''."""
+    if ent is not None:
+        disp = re.sub(r'[*_`]', '', (tgutils.get_display_name(ent) or '').strip())
+        if disp:
+            return disp
+        u = getattr(ent, 'username', None)
+        if u:
+            return f'@{u}'
+    u = (username or '').strip().lstrip('@')
+    return f'@{u}' if u else ''
+
+
+def watch_label(target_id, username=None, ent=None):
+    """«Имя Фамилия [`123`]» — цель так, как просят: имя профиля + ID."""
+    name = _profile_name(ent, username) or f'id {target_id}'
+    tid = getattr(ent, 'id', None) or target_id
+    return f'**{name}** [`{tid}`]'
+
+
+async def awatch_label(target_id, username=None):
+    ent = None
+    try:
+        ent = await client.get_entity(int(target_id))
+    except Exception:
+        pass
+    return watch_label(target_id, username, ent)
+
+
+async def _watch_now(target_id):
+    """Какой статус цели видит Telegram API прямо сейчас (диагностика)."""
+    try:
+        ent = await client.get_entity(int(target_id))
+        return _status_name(getattr(ent, 'status', None))
+    except Exception as ex:
+        return f'err: {str(ex)[:40]}'
+
+
+async def _onwatch_fire(w, source):
+    """Цель появилась в сети → сообщение таргету + уведомление во внешнем боте."""
+    if (w.get('last_status') or 'unknown') == 'online':
+        return False
+    # статус помечаем до await — поллер и апдейт-хендлер не отправят дважды
+    db.update_online_watch_status(w['id'], 'online')
+    tid = w['target_id']
+    uname = w.get('target_username') or ''
+    ent = None
+    try:
+        ent = await client.get_entity(int(tid))
+    except Exception:
+        ent = None
+    name = _profile_name(ent, uname) or f'id {tid}'
+    plain = f"{name} [{tid}]"
+    logger.info(f"[ONWATCH] цель появилась в сети ({source}): {watch_label(tid, uname, ent)}")
+    try:
+        await client.send_message(tid, w['message'])
+    except Exception as ex:
+        logger.warning(f"[ONWATCH] не удалось отправить сообщение {plain}: {ex}")
+        try:
+            await notify.error_alert("ONWATCH", f"Не удалось отправить сообщение {plain}: {ex}")
+        except Exception:
+            pass
+        return False
+    try:
+        await notify.online_watch(uname, tid, w['message'], name=name)
+    except Exception as ex:
+        logger.warning(f"[ONWATCH] уведомление не отправлено: {ex}")
+    return True
+
+
 @client.on(events.NewMessage(func=owner_filter))
 async def onwatch_unified(e):
     try:
@@ -2702,9 +2792,12 @@ async def onwatch_unified(e):
                 return
             lines = []
             for r in rows:
-                uname = r['target_username']
-                tgt = f"@{uname}" if uname else f"id `{r['target_id']}`"
-                lines.append(f"• **{tgt}** [`{r['target_id']}`] | last: `{r['last_status']}`\n  _{r['message'][:40]}{'...' if len(r['message'])>40 else ''}_")
+                label = await awatch_label(r['target_id'], r['target_username'])
+                now = await _watch_now(r['target_id'])
+                lines.append(
+                    f"• {label} | was: `{r['last_status']}` → now: `{now}`\n"
+                    f"  _{r['message'][:40]}{'...' if len(r['message']) > 40 else ''}_"
+                )
             await respond(e, ui.card(f"📡 ONWATCH ({len(rows)})", "\n".join(lines),
                                      hint="`!unonwatch @username|ID` — снять трек"))
             db.bump_stat('cmds')
@@ -2725,7 +2818,8 @@ async def onwatch_unified(e):
                 db.bump_stat('cmds')
                 return
             db.remove_online_watch(target_id=ent.id)
-            await respond(e, ui.ok(ui.kv("Цель", f"**{entity_label(ent, target_raw.lstrip('@'))}**"),
+            logger.info(f"[ONWATCH] трек снят: {watch_label(ent.id, getattr(ent, 'username', None), ent=ent)}")
+            await respond(e, ui.ok(ui.kv("Цель", watch_label(ent.id, getattr(ent, 'username', None), ent=ent)),
                                    title="Отслеживание снято"))
             db.bump_stat('cmds')
             return
@@ -2757,10 +2851,13 @@ async def onwatch_unified(e):
                 await respond(e, ui.err(f"Ошибка БД: {ex}", title="ONWATCH"))
                 db.bump_stat('cmds')
                 return
+            logger.info(f"[ONWATCH] трек добавлен: {watch_label(ent.id, getattr(ent, 'username', None), ent=ent)} "
+                        f"chat={e.chat_id} статус={_status_name(getattr(ent, 'status', None))}")
             await respond(e, ui.card(
                 "✅ ONWATCH добавлен",
                 ui.rows(
-                    ("Цель", f"**{entity_label(ent, target_raw.lstrip('@'))}**"),
+                    ("Цель", watch_label(ent.id, getattr(ent, 'username', None), ent=ent)),
+                    ("Статус сейчас", f"`{_status_name(getattr(ent, 'status', None))}`"),
                     ("Сообщение", f"_{msg_text}_"),
                 ),
                 footer="Как только цель окажется в сети после оффлайна — отправлю сообщение и уведомлю во внешнем боте.\nТрек работает раз за разом.",
@@ -2783,59 +2880,69 @@ async def onwatch_unified(e):
 
 
 async def online_watcher():
+    global _watch_count_logged
+    logger.info("[ONWATCH] поллер статусов запущен (интервал 35с)")
     while True:
         try:
             watches = db.get_online_watches()
+            if _watch_count_logged != len(watches):
+                _watch_count_logged = len(watches)
+                logger.info(f"[ONWATCH] активных треков: {len(watches)}")
             if not watches:
                 await asyncio.sleep(40)
                 continue
             for w in watches:
                 try:
                     ent = await client.get_entity(w['target_id'])
-                    status = ent.status
-                    cur = 'unknown'
-                    if isinstance(status, UserStatusOnline):
-                        cur = 'online'
-                    elif isinstance(status, UserStatusOffline):
-                        cur = 'offline'
-                    elif isinstance(status, UserStatusRecently):
-                        cur = 'recently'
-                    elif isinstance(status, UserStatusLastWeek):
-                        cur = 'last_week'
-                    elif isinstance(status, UserStatusLastMonth):
-                        cur = 'last_month'
-                    else:
-                        cur = 'unknown'
+                    cur = _status_name(getattr(ent, 'status', None))
                     prev = w['last_status'] or 'unknown'
+                    if cur != prev:
+                        logger.info(f"[ONWATCH] {w['target_id']}: {prev} → {cur}")
+                        _watch_err_logged.discard(w['target_id'])
                     if prev != 'online' and cur == 'online':
-                        try:
-                            await client.send_message(w['target_id'], w['message'])
-                        except Exception as ex:
-                            logger.warning(f"[ONWATCH] Не удалось отправить сообщение {w['target_id']}: {ex}")
-                            try:
-                                await notify.error_alert("ONWATCH", f"Не удалось отправить сообщение @{w['target_username']} [{w['target_id']}]: {ex}")
-                            except Exception:
-                                pass
-                            db.update_online_watch_status(w['id'], cur)
-                            continue
-                        try:
-                            await notify.online_watch(w['target_username'] or str(w['target_id']), w['target_id'], w['message'])
-                        except Exception:
-                            pass
-                        db.update_online_watch_status(w['id'], cur)
-                        continue
-                    if prev == 'online' and cur != 'online':
-                        db.update_online_watch_status(w['id'], cur)
+                        await _onwatch_fire(w, 'poll')
                         continue
                     if prev != cur:
                         db.update_online_watch_status(w['id'], cur)
-                        continue
+                    continue
+                except FloodWaitError as fe:
+                    logger.warning(f"[ONWATCH] FloodWait {fe.seconds}s — пауза")
+                    await asyncio.sleep(fe.seconds + 5)
+                    break
                 except Exception as ex:
-                    logger.debug(f"[ONWATCH] skip {w.get('target_id')}: {ex}")
+                    if w['target_id'] not in _watch_err_logged:
+                        _watch_err_logged.add(w['target_id'])
+                        logger.warning(f"[ONWATCH] не удалось проверить {w['target_id']}: {ex}")
+                    else:
+                        logger.debug(f"[ONWATCH] skip {w['target_id']}: {ex}")
                     continue
         except Exception as ex:
             logger.warning(f"[ONWATCH] loop err: {ex}")
         await asyncio.sleep(35)
+
+
+@client.on(events.UserUpdate)
+async def onwatch_status_event(e):
+    """Мгновенная реакция на updateUserStatus — ловит появление в сети
+    между опросами (35с) и короткие заходы в сеть."""
+    try:
+        if e.status is None:
+            return  # typing и прочие user-update без статуса
+        tid = e.user_id
+        if not tid or tid == OWNER_ID:
+            return
+        w = db.get_online_watch_by_target(tid)
+        if not w:
+            return
+        cur = _status_name(e.status)
+        prev = w['last_status'] or 'unknown'
+        logger.info(f"[ONWATCH] апдейт статуса: id={tid} {prev} → {cur}")
+        if cur == 'online':
+            await _onwatch_fire(w, 'update')
+        elif cur != 'unknown' and cur != prev:
+            db.update_online_watch_status(w['id'], cur)
+    except Exception as ex:
+        logger.warning(f"[ONWATCH] status-event err: {ex}")
 
 @client.on(events.NewMessage(outgoing=True, func=lambda e: e.is_private and e.reply_to_msg_id))
 async def rp_outgoing_handler(event):

@@ -214,10 +214,10 @@ class Notifier:
                 continue
             await self._process_updates(data.get('result'), handler, message_handler)
 
-    async def online_watch(self, username: str, target_id: int, sent_msg: str):
+    async def online_watch(self, username: str, target_id: int, sent_msg: str, name: str = None):
         if not NOTIFY_ONLINE_WATCH:
             return
-        user_str = self._format_user(target_id, username=username)
+        user_str = self._format_user(target_id, username=username, name=name)
         msg = (
             f"⚡ <b>ONLINE WATCH</b>\n\n"
             f"👤 Пользователь: {user_str}\n"
