@@ -110,13 +110,15 @@ class Notifier:
         return ok
 
     async def edit(self, message_id: int, text: str, buttons=None, preview: bool = False,
-                   business_connection_id=None):
+                   business_connection_id=None, chat_id=None):
         """Редактирует сообщение бота. Для сообщений, отправленных от имени
-        аккаунта (Telegram Business), обязателен business_connection_id."""
-        if not self.enabled or not self.chat_id:
+        аккаунта (Telegram Business), обязателен business_connection_id.
+        chat_id — чат, где лежит сообщение (по умолчанию чат с ботом);
+        для меню в чужом ЛС указывается chat_id из callback-запроса."""
+        if not self.enabled:
             return False
         payload = {
-            "chat_id": self.chat_id,
+            "chat_id": self.chat_id if chat_id is None else chat_id,
             "message_id": message_id,
             "text": text,
             "parse_mode": "HTML",

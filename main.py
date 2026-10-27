@@ -3038,8 +3038,25 @@ async def _pult_toggle(action):
     return None
 
 
+async def _cb_render(mid, chat_id, biz, html, buttons):
+    """Обновляет карточку по нажатию кнопки. Если редактирование не удалось
+    (не тот chat_id / нет business_connection_id) — шлёт новую карточку
+    в тот же чат, чтобы нажатие не выглядело «мёртвым»."""
+    ok = await notify.edit(mid, html, buttons=buttons,
+                           business_connection_id=biz, chat_id=chat_id)
+    if ok:
+        return True
+    logger.warning(f"[BOT-CB] edit не удался: chat={chat_id} biz={bool(biz)} — пробую новое сообщение")
+    if not chat_id:
+        return False
+    return await notify.send(html, buttons=buttons,
+                             business_connection_id=biz, chat_id=chat_id)
+
+
 async def handle_bot_callback(q):
-    """callback_query от внешнего бота: пульт (c:*) и справка (h:*)."""
+    """callback_query от внешнего бота: пульт (c:*) и справка (h:*).
+    Для сообщений, отправленных от имени аккаунта (Telegram Business),
+    нужен и chat_id чата, и business_connection_id — иначе edit не сработает."""
     data = q.get('data') or ''
     qid = q.get('id')
     uid = (q.get('from') or {}).get('id')
@@ -3047,8 +3064,12 @@ async def handle_bot_callback(q):
     # (Telegram Business) — в нём есть business_connection_id, он обязателен для edit
     msg = q.get('message') or {}
     mid = msg.get('message_id')
+    chat_id = (msg.get('chat') or {}).get('id')
     biz = msg.get('business_connection_id')
-    logger.info(f"[BOT-CB] нажатие: data={data!r} from={uid} msg={mid} biz={biz}")
+    if not biz and chat_id is not None and str(chat_id) != str(notify.chat_id):
+        # бизнес-сообщение в чужом чате, но поле не доехало — берём из реконнекта
+        biz = notify.business_connection_id
+    logger.info(f"[BOT-CB] нажатие: data={data!r} from={uid} chat={chat_id} msg={mid} biz={biz}")
 
     if uid != OWNER_ID:
         await notify.answer_callback(qid, "⛔ Нет доступа", alert=True)
@@ -3072,22 +3093,19 @@ async def handle_bot_callback(q):
             card = ui.card("🏓 Пинг (MTProto)",
                            ui.rows(("Задержка", f"`{ms:.1f} мс`", "⚡"),
                                    ("Качество", q_show, "📶")))
-        await notify.edit(mid, ui.to_html(card), buttons=[[dict(BACK_BTN)]],
-                          business_connection_id=biz)
+        await _cb_render(mid, chat_id, biz, ui.to_html(card), [[dict(BACK_BTN)]])
         return
 
     # пульт: переключение режимов → перерисовать меню с новым состоянием
     if data.startswith('c:'):
         last = await _pult_toggle(data[2:])
         text, buttons = help_data.menu_view(last_action=last)
-        await notify.edit(mid, ui.to_html(text), buttons=buttons,
-                          business_connection_id=biz)
+        await _cb_render(mid, chat_id, biz, ui.to_html(text), buttons)
         return
 
     # справка: навигация по разделам (h:back / h:all / h:<раздел>)
     text, buttons = help_data.help_view(data)
-    await notify.edit(mid, ui.to_html(text), buttons=buttons,
-                      business_connection_id=biz)
+    await _cb_render(mid, chat_id, biz, ui.to_html(text), buttons)
 
 
 @client.on(events.NewMessage(pattern=r'!menu$', func=owner_filter))
