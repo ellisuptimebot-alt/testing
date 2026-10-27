@@ -2,6 +2,7 @@ import sqlite3
 import threading
 import time
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,8 @@ class Storage:
                     chat_id INTEGER,
                     last_status TEXT DEFAULT 'unknown',
                     enabled INTEGER DEFAULT 1,
-                    created_at INTEGER
+                    created_at INTEGER,
+                    last_fired INTEGER DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS pm_msg_cache (
                     chat_id INTEGER,
@@ -72,6 +74,7 @@ class Storage:
                     date INTEGER,
                     verified INTEGER DEFAULT 1,
                     last_seen INTEGER DEFAULT 0,
+                    media_file TEXT,
                     PRIMARY KEY(chat_id, msg_id)
                 );
                 CREATE TABLE IF NOT EXISTS reminders (
@@ -88,6 +91,13 @@ class Storage:
                 cur.execute('ALTER TABLE pm_msg_cache ADD COLUMN verified INTEGER DEFAULT 1')
             if 'last_seen' not in cols:
                 cur.execute('ALTER TABLE pm_msg_cache ADD COLUMN last_seen INTEGER DEFAULT 0')
+            if 'media_file' not in cols:
+                cur.execute('ALTER TABLE pm_msg_cache ADD COLUMN media_file TEXT')
+            # Миграция online_watch: кулдаун последней отправки уведомления
+            cur.execute('PRAGMA table_info(online_watch)')
+            ocols = {row[1] for row in cur.fetchall()}
+            if 'last_fired' not in ocols:
+                cur.execute('ALTER TABLE online_watch ADD COLUMN last_fired INTEGER DEFAULT 0')
             cur.execute('CREATE INDEX IF NOT EXISTS idx_pm_msg_id ON pm_msg_cache(msg_id)')
             cur.execute('CREATE INDEX IF NOT EXISTS idx_pm_chat_date ON pm_msg_cache(chat_id, date)')
             self.conn.commit()
@@ -350,6 +360,17 @@ class Storage:
                 self.conn.execute('DELETE FROM online_watch WHERE target_id = ?', (int(target_id),))
             self.conn.commit()
 
+    def touch_online_watch_fired(self, watch_id, ts=None):
+        """Отметка момента последней ОТПРАВКИ уведомления «появился в сети».
+        Кулдаун меряется от неё (а не от последней активности) и хранится в БД —
+        иначе активный человек навсегда глушит все уведомления."""
+        with self.lock:
+            self.conn.execute(
+                'UPDATE online_watch SET last_fired = ? WHERE id = ?',
+                (int(ts if ts else time.time()), int(watch_id))
+            )
+            self.conn.commit()
+
     def get_online_watch_by_target(self, target_id):
         with self.lock:
             cur = self.conn.cursor()
@@ -365,6 +386,15 @@ class Storage:
             self.conn.execute(
                 'INSERT OR REPLACE INTO pm_msg_cache (chat_id, msg_id, sender_id, sender_name, text, has_media, media_type, date, verified, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)',
                 (int(chat_id), int(msg_id), int(sender_id) if sender_id else 0, sender_name or '', text or '', 1 if has_media else 0, media_type or '', now, now)
+            )
+            self.conn.commit()
+
+    def set_pm_media_file(self, chat_id, msg_id, path):
+        """Запомнить локальный файл медиа для сообщения (для re-send при удалении)."""
+        with self.lock:
+            self.conn.execute(
+                'UPDATE pm_msg_cache SET media_file = ? WHERE chat_id = ? AND msg_id = ?',
+                (path or '', int(chat_id), int(msg_id))
             )
             self.conn.commit()
 
@@ -422,6 +452,27 @@ class Storage:
             )
             self.conn.commit()
 
+    def prune_pm_media(self, keep=300):
+        """Ограничиваем число сохранённых медиафайлов (последние keep).
+        Возвращает пути удалённых записей — их файлы удаляет вызывающий код."""
+        removed = []
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                'SELECT chat_id, msg_id, media_file FROM pm_msg_cache '
+                'WHERE media_file IS NOT NULL AND media_file != "" '
+                'ORDER BY date DESC LIMIT -1 OFFSET ?',
+                (int(keep),)
+            )
+            for row in cur.fetchall():
+                removed.append(row['media_file'])
+                self.conn.execute(
+                    'UPDATE pm_msg_cache SET media_file = NULL WHERE chat_id = ? AND msg_id = ?',
+                    (row['chat_id'], row['msg_id'])
+                )
+            self.conn.commit()
+        return removed
+
     def reset_pm_verified(self):
         """Сброс базы на старте: первая сверка только фиксирует наличие,
         чтобы не заваливать уведомлениями за время оффлайна."""
@@ -436,5 +487,18 @@ class Storage:
             row = cur.fetchone()
             cnt = row['c'] if row else 0
             if cnt > limit:
+                cur.execute(
+                    'SELECT media_file FROM pm_msg_cache WHERE rowid IN '
+                    '(SELECT rowid FROM pm_msg_cache ORDER BY date ASC LIMIT ?) '
+                    'AND media_file IS NOT NULL AND media_file != ""',
+                    (cnt - limit,)
+                )
+                files = [r['media_file'] for r in cur.fetchall()]
                 cur.execute('DELETE FROM pm_msg_cache WHERE rowid IN (SELECT rowid FROM pm_msg_cache ORDER BY date ASC LIMIT ?)', (cnt - limit,))
                 self.conn.commit()
+                for p in files:
+                    try:
+                        if os.path.isfile(p):
+                            os.remove(p)
+                    except OSError:
+                        pass

@@ -123,6 +123,88 @@ async def _get_me_id():
     return _me_id_cache
 
 
+async def _is_own_message(sender_id):
+    """Сообщение отправлено именно этим аккаунтом (владельца).
+    Единая проверка для всех каналов удаления/правок — бот не должен
+    реагировать на собственные удаления/правки."""
+    if not sender_id:
+        return False
+    try:
+        me = await _get_me_id()
+    except Exception:
+        me = None
+    return bool(me) and sender_id == me
+
+
+# Лимит проактивного кэша медиа: меньше лимита Bot API (50 МБ),
+# чтобы файл гарантированно дошёл через внешнего бота
+MEDIA_CACHE_MAX_MB = 45
+_media_restore_recent = {}   # replied_msg_id → ts последнего восстановления (дедуп 5 мин)
+
+
+async def _try_cache_media(chat_id, msg):
+    """Скачивает фото/видео/кружок из ЛС-сообщения сразу при получении:
+    файл пригодится, если сообщение потом удалят или на него ответят
+    (к моменту удаления на сервере его уже нет — скачать будет нечего).
+    Сгорающее (ttl) медиа НЕ трогаем, чтобы не сжечь чей-то просмотр."""
+    try:
+        media = getattr(msg, 'media', None)
+        if not media:
+            return
+        if getattr(media, 'ttl_seconds', None):
+            return  # view-once/self-destruct — пропускаем
+        target = getattr(msg, 'photo', None) or getattr(msg, 'video', None) or getattr(msg, 'video_note', None)
+        if target is None:
+            return
+        if getattr(msg, 'photo', None) is None:
+            size = getattr(target, 'size', 0) or 0
+            if size > MEDIA_CACHE_MAX_MB * 1024 * 1024:
+                return
+        os.makedirs(MEDIA_DIR, exist_ok=True)
+        path = await msg.download_media(file=os.path.join(MEDIA_DIR, f'pm_{chat_id}_{msg.id}_'))
+        if path:
+            db.set_pm_media_file(chat_id, msg.id, path)
+            for p in (db.prune_pm_media() or []):
+                _delete_media_file(p)
+    except Exception as ex:
+        logger.debug(f"[PM-CACHE-MEDIA] chat={chat_id} msg={getattr(msg, 'id', None)}: {ex}")
+
+
+def _delete_media_file(path):
+    """Удаляет сохранённый медиафайл (после re-send или прореживания)."""
+    if not path:
+        return
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+async def _restore_media_to_notify(old, chat_id, msg_id, text_note):
+    """Скачивает медиа из сообщения (по реплаю или до удаления) и
+    переотправляет через внешнего бота с подписью. Возвращает True при успехе."""
+    try:
+        path = (old or {}).get('media_file') or ''
+        fresh = not path or not os.path.isfile(path)
+        if fresh:
+            msg = await client.get_messages(chat_id, ids=msg_id)
+            if not msg or not getattr(msg, 'media', None):
+                return False
+            os.makedirs(MEDIA_DIR, exist_ok=True)
+            path = await msg.download_media(file=os.path.join(MEDIA_DIR, f'mr_{msg_id}_'))
+            if not path:
+                return False
+            try:
+                db.set_pm_media_file(chat_id, msg_id, path)
+            except Exception:
+                pass
+        return await notify.pm_media(chat_id, old, path, text_note)
+    except Exception as ex:
+        logger.warning(f"[PM-MEDIA] не удалось получить медиа msg={msg_id}: {ex}")
+        return False
+
+
 @client.on(events.Raw)
 async def pm_delete_raw_update(e):
     try:
@@ -141,20 +223,21 @@ async def pm_delete_raw_update(e):
             if not old:
                 logger.info(f"[PM-DEL-RAW] msg={msg_id} нет в кэше ЛС — пропуск (не ЛС или старое)")
                 continue
-            # своё сообщение (исходящее) — уведомление не отправляем,
-            # но протухшую строку кэша убираем
-            if old.get('sender_id'):
+            # своё сообщение (исходящее) — уведомление об удалении не отправляем,
+            # но если это было фото/видео — сохраняем копию через внешнего бота
+            if old.get('sender_id') and await _is_own_message(old['sender_id']):
+                logger.info(f"[PM-DEL-RAW] msg={msg_id} своё сообщение — пропуск")
+                if old.get('has_media'):
+                    await _restore_media_to_notify(
+                        old, old.get('chat_id'), msg_id,
+                        "🗑 <b>Твоё сообщение удалено</b> (медиа сохранено)"
+                    )
+                _delete_media_file(old.get('media_file'))
                 try:
-                    _me = await _get_me_id()
+                    db.delete_pm_cached(old.get('chat_id'), msg_id)
                 except Exception:
-                    _me = None
-                if _me and old['sender_id'] == _me:
-                    logger.info(f"[PM-DEL-RAW] msg={msg_id} своё сообщение — пропуск")
-                    try:
-                        db.delete_pm_cached(old.get('chat_id'), msg_id)
-                    except Exception:
-                        pass
-                    continue
+                    pass
+                continue
             username = None
             if old.get('sender_id'):
                 try:
@@ -203,7 +286,18 @@ async def _pm_delete_worker():
                 media_type = None
 
             logger.info(f"[PM-DEL-WORKER] Отправляю уведомление: from={sender_id} name={sender_name} txt_len={len(text)} cache={bool(old)}")
-            res = await notify.pm_deleted(chat_id, sender_id, sender_name, text, has_media, media_type, username=username, cached=bool(old))
+            # финальный гейт: оповещения на свои сообщения не уходят
+            if sender_id and await _is_own_message(sender_id):
+                logger.info(f"[PM-DEL-WORKER] msg={msg_id} своё сообщение — пропуск")
+                _delete_media_file((old or {}).get('media_file'))
+                try:
+                    db.delete_pm_cached(chat_id, msg_id)
+                except Exception:
+                    pass
+                continue
+            res = await notify.pm_deleted(chat_id, sender_id, sender_name, text, has_media, media_type,
+                                          username=username, cached=bool(old),
+                                          media_file=(old or {}).get('media_file'))
             logger.info(f"[PM-DEL-WORKER] Результат отправки: {res}")
 
             try:
@@ -262,6 +356,17 @@ async def pm_presence_watcher(interval=45, max_age=259200, chats_per_cycle=20, i
                             continue
                         # сообщение отсутствует в чате
                         if row.get('verified'):
+                            # своё сообщение — молча убираем строку, не оповещаем
+                            if await _is_own_message(row.get('sender_id')):
+                                logger.info(
+                                    f"[PM-CHECK] своё сообщение исчезло: chat={cid} msg={row['msg_id']} — пропуск"
+                                )
+                                _delete_media_file(row.get('media_file'))
+                                try:
+                                    db.delete_pm_cached(cid, row['msg_id'])
+                                except Exception:
+                                    pass
+                                continue
                             logger.info(
                                 f"[PM-CHECK] ПРОПАЛО: chat={cid} msg={row['msg_id']} "
                                 f"from={row.get('sender_name')} txt={(row.get('text') or '')[:30]!r}"
@@ -486,6 +591,8 @@ async def pm_cache_incoming(e):
         sender_name = f"{getattr(sender, 'first_name', '') or ''} {getattr(sender, 'last_name', '') or ''}".strip() or str(e.sender_id)
         db.cache_pm_message(e.chat_id, e.id, e.sender_id, sender_name, text, has_media, media_type)
         db.clean_pm_cache()
+        if has_media:
+            await _try_cache_media(e.chat_id, msg)
     except Exception as ex:
         logger.debug(f"pm_cache_incoming err: {ex}")
 
@@ -519,6 +626,8 @@ async def pm_cache_outgoing(e):
         sender_name = f"{getattr(me, 'first_name', '') or ''} {getattr(me, 'last_name', '') or ''}".strip() or 'Ты'
         db.cache_pm_message(e.chat_id, e.id, me.id, sender_name, text, has_media, media_type)
         db.clean_pm_cache()
+        if has_media:
+            await _try_cache_media(e.chat_id, msg)
     except Exception as ex:
         logger.debug(f"pm_cache_outgoing err: {ex}")
 
@@ -530,7 +639,7 @@ async def pm_edited_handler(e):
             return
         # Свои исходящие сообщения не оповещаем — фича следит за тем,
         # что делает собеседник (правки/удаления в ЛС), а не за своими.
-        if getattr(e.message, 'out', False):
+        if getattr(e.message, 'out', False) or await _is_own_message(e.sender_id):
             logger.info(f"[PM-EDIT] исходящее (своё) — пропуск msg={e.id}")
             return
         new_text = e.message.text or e.message.message or ''
@@ -587,6 +696,80 @@ async def pm_edited_handler(e):
                              new_text, bool(old['has_media']), old['media_type'])
     except Exception as ex:
         logger.warning(f"pm_edited_handler err: {ex}", exc_info=True)
+
+
+def _media_type(msg):
+    """Тип медиа сообщения (цепочка как в кэше pm_msg_cache)."""
+    if getattr(msg, 'photo', None):
+        return 'photo'
+    if getattr(msg, 'video_note', None):
+        return 'video_note'
+    if getattr(msg, 'video', None):
+        return 'video'
+    if getattr(msg, 'document', None):
+        return 'document'
+    if getattr(msg, 'voice', None):
+        return 'voice'
+    if getattr(msg, 'audio', None):
+        return 'audio'
+    if getattr(msg, 'sticker', None):
+        return 'sticker'
+    if getattr(msg, 'gif', None):
+        return 'gif'
+    return None
+
+
+@client.on(events.NewMessage(func=lambda e: bool(e.reply_to_msg_id) and e.is_private))
+async def media_reply_restore(e):
+    """Реплай на сообщение с фото/видео (в т.ч. сгорающее) → скачать
+    и прислать файлом через внешнего бота с подписью.
+
+    Для сгорающего (view-once) скачивание сожжёт просмотр — это и есть
+    цель фичи: забрать копию, пока её не удалили/не закрыли."""
+    try:
+        text = (e.raw_text or '').strip()
+        if text.startswith('!'):
+            return  # команды — не триггер
+        rmid = e.reply_to_msg_id
+        now = time.time()
+        if now - _media_restore_recent.get(rmid, 0) < 300:
+            return  # дедуп: не спамим на повторные ответы одному сообщению
+        replied = await e.get_reply_message()
+        if not replied or not getattr(replied, 'media', None):
+            return
+        mtype = _media_type(replied)
+        if mtype not in ('photo', 'video', 'video_note'):
+            return  # стикеры/голосовые/гифы не тащим — только фото/видео/кружки
+        _media_restore_recent[rmid] = now
+        for k in [k for k, v in _media_restore_recent.items() if now - v > 600]:
+            _media_restore_recent.pop(k, None)
+
+        old = db.get_pm_cached(e.chat_id, rmid)
+        if not old:
+            try:
+                sender = await replied.get_sender()
+                name = tgutils.get_display_name(sender) if sender else ''
+            except Exception:
+                name = ''
+            old = {
+                'chat_id': e.chat_id, 'msg_id': rmid,
+                'sender_id': replied.sender_id or 0,
+                'sender_name': name or str(replied.sender_id or ''),
+                'text': replied.raw_text or '',
+                'has_media': 1, 'media_type': mtype, 'media_file': '',
+            }
+        logger.info(f"[PM-MEDIA] реплай на msg={rmid} (type={mtype}) — сохраняю через внешнего бота")
+        ok = await _restore_media_to_notify(
+            old, e.chat_id, rmid,
+            "🔥 <b>Медиа сохранено по реплаю</b>"
+        )
+        if not ok:
+            await notify.pm_media(
+                e.chat_id, old, None,
+                "🔥 Медиа не удалось скачать (возможно, уже просмотрено или удалено)"
+            )
+    except Exception as ex:
+        logger.warning(f"[PM-MEDIA] media_reply_restore err: {ex}", exc_info=True)
 
 
 # ── Плагины: регистрация всех команд из plugins/*.py ──

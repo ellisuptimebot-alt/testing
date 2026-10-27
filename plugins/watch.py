@@ -43,9 +43,10 @@ from telethon.tl.types import (
 
 
 _watch_count_logged = None
-_watched_ids = set()          # tid отслеживаемых — быстрый фильтр без запроса в БД
-_last_activity = {}           # tid → ts последней активности (сообщение/typing)
-_ACTIVITY_QUIET = 600         # тишина ≥10 мин = «ушёл»; новая активность = «появился в сети»
+# Кулдаун «появления в сети»: не чаще одного уведомления на цель в 600 с.
+# Меряется от последней ОТПРАВКИ (last_fired в БД) — переживает рестарты
+# и не зависит от «залипшего» статуса online.
+_FIRE_COOLDOWN = 600
 
 
 def _status_name(status):
@@ -102,13 +103,23 @@ async def _watch_now(target_id):
 
 
 async def _onwatch_fire(w, source):
-    """Цель появилась в сети → сообщение таргету + уведомление во внешнем боте."""
-    if (w.get('last_status') or 'unknown') == 'online':
+    """Цель появилась в сети → сообщение таргету + уведомление во внешнем боте.
+
+    Дедуп — только кулдаун от последней ОТПРАВКИ (last_fired в БД). Раньше тут
+    был жёсткий блок по last_status == 'online' + отсчёт от последней
+    активности: пока человек активен каждые <10 мин (typing/сообщения/галочки),
+    уведомления не уходили никогда, а «залипший» статус online гасил и
+    статусные триггеры — бот молчал, пока не приходил случайный offline-апдейт."""
+    fresh = db.get_online_watch_by_target(w.get('target_id'))
+    row = fresh or w
+    now = time.time()
+    if now - (row.get('last_fired') or 0) < _FIRE_COOLDOWN:
         return False
-    # статус помечаем до await — поллер и апдейт-хендлер не отправят дважды
-    db.update_online_watch_status(w['id'], 'online')
-    tid = w['target_id']
-    uname = w.get('target_username') or ''
+    # статус и отметку ставим до await — поллер и апдейт-хендлер не отправят дважды
+    db.update_online_watch_status(row['id'], 'online')
+    db.touch_online_watch_fired(row['id'], now)
+    tid = row['target_id']
+    uname = row.get('target_username') or ''
     ent = None
     try:
         ent = await client.get_entity(int(tid))
@@ -118,7 +129,7 @@ async def _onwatch_fire(w, source):
     plain = f"{name} [{tid}]"
     logger.info(f"[ONWATCH] цель появилась в сети ({source}): {watch_label(tid, uname, ent)}")
     try:
-        await client.send_message(tid, w['message'])
+        await client.send_message(tid, row['message'])
     except Exception as ex:
         logger.warning(f"[ONWATCH] не удалось отправить сообщение {plain}: {ex}")
         try:
@@ -127,7 +138,7 @@ async def _onwatch_fire(w, source):
             pass
         return False
     try:
-        await notify.online_watch(uname, tid, w['message'], name=name)
+        await notify.online_watch(uname, tid, row['message'], name=name)
     except Exception as ex:
         logger.warning(f"[ONWATCH] уведомление не отправлено: {ex}")
     return True
@@ -178,8 +189,6 @@ async def onwatch_unified(e):
                 db.bump_stat('cmds')
                 return
             db.remove_online_watch(target_id=ent.id)
-            _watched_ids.discard(ent.id)
-            _last_activity.pop(ent.id, None)
             logger.info(f"[ONWATCH] трек снят: {watch_label(ent.id, getattr(ent, 'username', None), ent=ent)}")
             await respond(e, ui.ok(ui.kv("Цель", watch_label(ent.id, getattr(ent, 'username', None), ent=ent)),
                                    title="Отслеживание снято"))
@@ -215,8 +224,7 @@ async def onwatch_unified(e):
                 return
             logger.info(f"[ONWATCH] трек добавлен: {watch_label(ent.id, getattr(ent, 'username', None), ent=ent)} "
                         f"chat={e.chat_id} статус={_status_name(getattr(ent, 'status', None))}")
-            _watched_ids.add(ent.id)
-            _last_activity.pop(ent.id, None)
+            # счётчик треков пересчитает поллер на следующем цикле
             await respond(e, ui.card(
                 "✅ ONWATCH добавлен",
                 ui.rows(
@@ -244,14 +252,13 @@ async def onwatch_unified(e):
 
 
 async def online_watcher():
-    global _watch_count_logged, _watched_ids
+    global _watch_count_logged
     logger.info("[ONWATCH] поллер статусов запущен (5–10с для 1–5 целей, до 35с)")
     interval = 10
     interval_logged = None
     while True:
         try:
             watches = db.get_online_watches()
-            _watched_ids = {w['target_id'] for w in watches}
             if _watch_count_logged != len(watches):
                 _watch_count_logged = len(watches)
                 logger.info(f"[ONWATCH] активных треков: {len(watches)}")
@@ -265,8 +272,11 @@ async def online_watcher():
             if interval_logged != interval:
                 interval_logged = interval
                 logger.info(f"[ONWATCH] интервал опроса: {interval}с (целей: {n})")
-            for w in watches:
+            for w0 in watches:
                 try:
+                    # свежая строка из БД: параллельные апдейты могли сменить
+                    # статус, пока цикл ждал на предыдущей цели
+                    w = db.get_online_watch_by_target(w0['target_id']) or w0
                     ent = await client.get_entity(w['target_id'])
                     cur = _status_name(getattr(ent, 'status', None))
                     prev = w['last_status'] or 'unknown'
@@ -310,8 +320,6 @@ async def onwatch_status_event(e):
             return
         if e.status is None and e.typing is None:
             return  # прочие user-update без статуса и без активности
-        if tid not in _watched_ids:
-            return
         w = db.get_online_watch_by_target(tid)
         if not w:
             return
@@ -324,13 +332,9 @@ async def onwatch_status_event(e):
             elif cur != 'unknown' and cur != prev:
                 db.update_online_watch_status(w['id'], cur)
             return
-        # typing/choose_sticker/speak = пользователь реально в сети
-        now = time.time()
-        gap = now - _last_activity.get(tid, 0)
-        _last_activity[tid] = now
-        if gap >= _ACTIVITY_QUIET and (w['last_status'] or 'unknown') != 'online':
-            logger.info(f"[ONWATCH] активность (typing): id={tid}")
-            await _onwatch_fire(w, 'typing')
+        # typing/choose_sticker/speak = пользователь реально в сети;
+        # кулдаун от последней отправки решает, уходить ли уведомлению
+        await _onwatch_fire(w, 'typing')
     except Exception as ex:
         logger.warning(f"[ONWATCH] status-event err: {ex}")
 
@@ -341,17 +345,13 @@ async def onwatch_activity_msg(e):
     Работает даже когда online-статус скрыт настройками приватности."""
     try:
         sid = e.sender_id
-        if not sid or sid == OWNER_ID or sid not in _watched_ids:
+        if not sid or sid == OWNER_ID:
             return
         w = db.get_online_watch_by_target(sid)
         if not w:
             return
-        now = time.time()
-        gap = now - _last_activity.get(sid, 0)
-        _last_activity[sid] = now
-        if gap >= _ACTIVITY_QUIET and (w['last_status'] or 'unknown') != 'online':
-            logger.info(f"[ONWATCH] активность (сообщение): id={sid}")
-            await _onwatch_fire(w, 'message')
+        # кулдаун от последней отправки — внутри _onwatch_fire
+        await _onwatch_fire(w, 'message')
     except Exception as ex:
         logger.warning(f"[ONWATCH] activity-msg err: {ex}")
 
@@ -366,16 +366,10 @@ async def onwatch_read_receipt(e):
         tid = e.chat_id
         if not tid or tid <= 0 or tid == OWNER_ID:
             return   # только ЛС (chat_id положителен и равен id юзера)
-        if tid not in _watched_ids:
-            return
         w = db.get_online_watch_by_target(tid)
         if not w:
             return
-        now = time.time()
-        gap = now - _last_activity.get(tid, 0)
-        _last_activity[tid] = now
-        if gap >= _ACTIVITY_QUIET and (w['last_status'] or 'unknown') != 'online':
-            logger.info(f"[ONWATCH] активность (прочитал мои сообщения): id={tid}")
-            await _onwatch_fire(w, 'read')
+        # кулдаун от последней отправки — внутри _onwatch_fire
+        await _onwatch_fire(w, 'read')
     except Exception as ex:
         logger.warning(f"[ONWATCH] read-receipt err: {ex}")

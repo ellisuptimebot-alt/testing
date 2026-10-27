@@ -74,6 +74,33 @@ class TestStorage(unittest.TestCase):
         after = self.db.all_stats().get('test_cmds', 0)
         self.assertEqual(after, before + 3)
 
+    # ── ONWATCH: кулдаун от последней отправки (last_fired) ──
+
+    def test_online_watch_fired_cooldown(self):
+        # новый трек: кулдауна нет (last_fired = 0) — караулить сразу
+        self.db.add_online_watch(777000111, 'tester', 'привет', 1, -100)
+        row = self.db.get_online_watch_by_target(777000111)
+        self.assertIsNotNone(row)
+        self.assertEqual(row.get('last_fired') or 0, 0)
+        try:
+            now = int(time.time())
+            self.db.touch_online_watch_fired(row['id'], now)
+            row2 = self.db.get_online_watch_by_target(777000111)
+            self.assertEqual(row2['last_fired'], now)
+
+            def would_fire(r, now_):
+                return now_ - (r.get('last_fired') or 0) >= 600
+
+            # 599с — молчим, 601с — шлём
+            self.assertFalse(would_fire(row2, now + 599))
+            self.assertTrue(would_fire(row2, now + 601))
+            # «залипший» статус online НЕ должен глушить (регресс старого бага)
+            row2['last_status'] = 'online'
+            self.assertTrue(would_fire(row2, now + 601))
+        finally:
+            self.db.remove_online_watch(target_id=777000111)
+        self.assertIsNone(self.db.get_online_watch_by_target(777000111))
+
     # ── Заметки ──
 
     def test_notes(self):

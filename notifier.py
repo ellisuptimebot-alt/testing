@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+from html import escape as _escape
 
 import aiohttp
 from config import (
@@ -25,6 +27,7 @@ class Notifier:
         # business_connection не переотправляет, апдейт приходит только при изменении)
         self.on_business_connection = None
         self._offset = 0
+        self._session = None  # единая aiohttp-сессия (см. _get_session)
         self.enabled = bool(NOTIFY_BOT_TOKEN and NOTIFY_CHAT_ID)
         if self.enabled:
             self._api_base = f"https://api.telegram.org/bot{NOTIFY_BOT_TOKEN}"
@@ -67,22 +70,79 @@ class Notifier:
             return None
         return json.dumps({"inline_keyboard": buttons}, ensure_ascii=False)
 
+    async def _get_session(self):
+        """Одна aiohttp-сессия на весь процесс: TCP+TLS-соединение
+        переиспользуется между запросами. Раньше сессия создавалась на каждый
+        вызов — каждая отправка платила рукопожатием, отсюда и задержки."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=100, ttl_dns_cache=300),
+                timeout=aiohttp.ClientTimeout(total=20),
+            )
+        return self._session
+
     async def _api(self, method, payload=None, timeout=15):
         """Универсальный вызов Bot API. Возвращает parsed json или None."""
         if not self.enabled or not self._api_base:
             return None
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-                async with session.post(f"{self._api_base}/{method}", json=payload or {}) as resp:
-                    data = await resp.json(content_type=None)
-                    if not data.get('ok'):
-                        desc = str(data.get('description') or '')
-                        if 'message is not modified' not in desc:
-                            logger.warning(f"[NOTIFY] {method}: HTTP {resp.status} {desc[:200]}")
-                    return data
+            session = await self._get_session()
+            async with session.post(
+                f"{self._api_base}/{method}",
+                json=payload or {},
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if not data.get('ok'):
+                    desc = str(data.get('description') or '')
+                    if 'message is not modified' not in desc:
+                        logger.warning(f"[NOTIFY] {method}: HTTP {resp.status} {desc[:200]}")
+                return data
         except Exception as ex:
             logger.warning(f"[NOTIFY] {method}: {ex}")
             return None
+
+    @staticmethod
+    def _truncate_html(s: str, limit: int = 1000) -> str:
+        """Усечение caption под лимит Bot API (1024) без разрезания тега."""
+        if len(s) <= limit:
+            return s
+        cut = s[:limit]
+        last = cut.rfind('<')
+        if last != -1 and '>' not in cut[last:]:
+            cut = cut[:last]
+        return cut.rstrip() + '…'
+
+    async def send_document(self, path: str, caption: str, chat_id=None):
+        """Отправка файла через Bot API (локальный upload, лимит 50 МБ)."""
+        if not self.enabled or not self._api_base:
+            return False
+        if not path or not os.path.isfile(path):
+            return False
+        target = self.chat_id if chat_id is None else chat_id
+        try:
+            session = await self._get_session()
+            form = aiohttp.FormData()
+            form.add_field('chat_id', str(target))
+            form.add_field('caption', self._truncate_html(caption or ''))
+            form.add_field('parse_mode', 'HTML')
+            with open(path, 'rb') as f:
+                form.add_field('document', f, filename=os.path.basename(path))
+                async with session.post(
+                    f"{self._api_base}/sendDocument",
+                    data=form,
+                    timeout=aiohttp.ClientTimeout(total=90),
+                ) as resp:
+                    data = await resp.json(content_type=None)
+            ok = bool(data and data.get('ok'))
+            if ok:
+                logger.info(f"[NOTIFY] Файл отправлен: {os.path.basename(path)} -> {target}")
+            else:
+                logger.warning(f"[NOTIFY] sendDocument не удался: {str(data)[:200]}")
+            return ok
+        except Exception as ex:
+            logger.warning(f"[NOTIFY] sendDocument: {ex}")
+            return False
 
     async def send(self, text: str, preview: bool = False, buttons=None,
                    business_connection_id=None, chat_id=None):
@@ -241,7 +301,7 @@ class Notifier:
         'document': 'Файл',
     }
 
-    async def pm_deleted(self, chat_id: int, sender_id: int, sender_name: str, text: str, has_media: bool, media_type: str, username: str = None, cached: bool = True):
+    async def pm_deleted(self, chat_id: int, sender_id: int, sender_name: str, text: str, has_media: bool, media_type: str, username: str = None, cached: bool = True, media_file: str = None):
         if not NOTIFY_PM_DELETE:
             return
         label = self._MEDIA_LABELS.get(media_type or '', 'Медиа')
@@ -266,7 +326,39 @@ class Notifier:
             f"{media_info}\n"
             f"<b>Текст:</b>\n<blockquote>{body}</blockquote>"
         )
+        # если медиа успели сохранить заранее — шлём сам файл с подписью
+        if media_file:
+            try:
+                if await self.send_document(media_file, msg):
+                    return True
+            except Exception as ex:
+                logger.warning(f"[NOTIFY] pm_deleted media: {ex}")
         await self.send(msg)
+
+    async def pm_media(self, chat_id, old, path, note):
+        """Пересылка медиа (фото/видео) через внешнего бота с подписью:
+        сохранение по реплаю на сгорающее или при удалении отправленного медиа.
+        old — строка кэша pm_msg_cache (или её аналог)."""
+        if not NOTIFY_PM_DELETE:
+            return False
+        old = old or {}
+        sender_id = old.get('sender_id') or 0
+        sender_name = old.get('sender_name') or ''
+        text = (old.get('text') or '').strip()
+        label = self._MEDIA_LABELS.get(old.get('media_type') or '', 'Медиа')
+        user_str = self._format_user(sender_id, name=sender_name)
+        parts = [
+            f"{note}\n",
+            f"💬 Чат: <code>{chat_id}</code>",
+            f"👤 От: {user_str}",
+            f"📎 Тип: {label}",
+        ]
+        if text:
+            parts.append(f"<b>Подпись:</b>\n<blockquote>{_escape(text)}</blockquote>")
+        caption = "\n".join(parts)
+        if not path or not os.path.isfile(path):
+            return False  # файла нет — вызывающий код сообщит об этом сам
+        return await self.send_document(path, caption)
 
     async def pm_edited(self, chat_id: int, sender_id: int, sender_name: str, old_text: str, new_text: str, username: str = None):
         if not NOTIFY_PM_EDIT:
