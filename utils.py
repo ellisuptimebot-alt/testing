@@ -139,17 +139,23 @@ def safe_eval(expr: str):
         return None
 
 
+_RU_UPPER = 'АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ'
+_RU_LOWER = 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя'
+
+
 def caesar(text, shift, dec=False):
+    """Шифр Цезаря: кириллица (33 буквы, Ё после Е) и латиница.
+    Ё/ё обрабатываются корректно — roundtrip восстанавливает текст."""
     if dec:
         shift = -shift
     out = []
     for c in text:
-        if 'А' <= c <= 'я' or c in 'ёЁ':
-            base = ord('А' if c.isupper() or c == 'Ё' else 'а')
-            size = 33
-            out.append(chr((ord(c) - base + shift) % size + base))
+        if c in _RU_UPPER:
+            out.append(_RU_UPPER[(_RU_UPPER.index(c) + shift) % len(_RU_UPPER)])
+        elif c in _RU_LOWER:
+            out.append(_RU_LOWER[(_RU_LOWER.index(c) + shift) % len(_RU_LOWER)])
         elif c.isalpha():
-            base = ord('A' if c.isupper() else 'a')
+            base = ord('A') if c.isupper() else ord('a')
             out.append(chr((ord(c) - base + shift) % 26 + base))
         else:
             out.append(c)
@@ -178,14 +184,35 @@ def gen_pwd(n=16, sym=True):
 
 
 def vigenere(text, key, dec=False):
+    """Шифр Виженера для кириллицы и латиницы. Сдвиг буквы — её позиция
+    в своём алфавите; кириллица больше не портится в латинские кракозябры."""
     key = key.upper()
+    shifts = []
+    for kc in key:
+        if kc in _RU_UPPER:
+            shifts.append(_RU_UPPER.index(kc))
+        elif 'A' <= kc <= 'Z':
+            shifts.append(ord(kc) - ord('A'))
+        else:
+            shifts.append(0)
+    if not shifts:
+        return text
     out, ki = [], 0
     for c in text:
-        if c.isalpha():
-            shift = ord(key[ki % len(key)]) - ord('A')
+        if c in _RU_UPPER or c in _RU_LOWER:
+            shift = shifts[ki % len(shifts)]
             if dec:
                 shift = -shift
-            base = ord('A' if c.isupper() else 'a')
+            if c in _RU_UPPER:
+                out.append(_RU_UPPER[(_RU_UPPER.index(c) + shift) % len(_RU_UPPER)])
+            else:
+                out.append(_RU_LOWER[(_RU_LOWER.index(c) + shift) % len(_RU_LOWER)])
+            ki += 1
+        elif c.isalpha():
+            shift = shifts[ki % len(shifts)]
+            if dec:
+                shift = -shift
+            base = ord('A') if c.isupper() else ord('a')
             out.append(chr((ord(c) - base + shift) % 26 + base))
             ki += 1
         else:

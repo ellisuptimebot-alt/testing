@@ -1,41 +1,22 @@
 # -*- coding: utf-8 -*-
 import asyncio
-import base64
-import datetime
-import hashlib
-import json
-import os
-import random
 import re
-import string
 import time
-import uuid
 
-import aiohttp
 from telethon import events
-from telethon.errors import FloodWaitError, MessageNotModifiedError
+from telethon.errors import FloodWaitError
 
 from client import client
-from config import OWNER_ID, MEDIA_DIR, MAX_FILE_SIZE_MB, MAX_COOLDOWN_ENTRIES, logger
-from core import (
-    db, state, owner_filter, respond, command_cooldown, reply_cooldown,
-    _get_translator,
-)
-from helpers import (
-    resolve_entity, entity_label, build_status_card,
-    safe_flood, shadow_delete_msg,
-)
-from utils import fmt_time, progress_bar, safe_eval, caesar, morse_enc, gen_pwd, vigenere
-from downloaders import run_download, send_and_clean
+from config import OWNER_ID, logger
+from core import db, owner_filter, respond
+from helpers import resolve_entity
 from notifier import notify
 import ui
 
-_log = logger
 
 _watch_err_logged = set()
 
 from telethon import utils as tgutils
-from telethon.tl import types
 from telethon.tl.types import (
     UserStatusOnline, UserStatusOffline, UserStatusRecently,
     UserStatusLastWeek, UserStatusLastMonth,
@@ -151,7 +132,8 @@ async def onwatch_unified(e):
         if not text:
             return
         low = text.lower()
-        if not low.startswith('!onwatch'):
+        # !unonwatch тоже должен проходить ранний return
+        if not (low.startswith('!onwatch') or low.startswith('!unonwatch')):
             return
 
         if low == '!onwatchlist' or low.startswith('!onwatchlist '):
@@ -183,8 +165,16 @@ async def onwatch_unified(e):
             target_raw = m.group(1)
             try:
                 ent = await resolve_entity(target_raw)
-            except Exception as ex:
-                await respond(e, ui.err(f"Не найден: {ex}", title="ONWATCH",
+            except Exception:
+                # аккаунт мог быть удалён — снимаем трек по числовому ID
+                if target_raw.isdigit():
+                    db.remove_online_watch(target_id=int(target_raw))
+                    logger.info(f"[ONWATCH] трек снят (без резолва): id {target_raw}")
+                    await respond(e, ui.ok(ui.kv("Цель", f"`{target_raw}`"),
+                                           title="Отслеживание снято"))
+                    db.bump_stat('cmds')
+                    return
+                await respond(e, ui.err(f"Не найден: {target_raw}", title="ONWATCH",
                                         hint="Формат: `!unonwatch @username|ID`"))
                 db.bump_stat('cmds')
                 return
@@ -327,8 +317,11 @@ async def onwatch_status_event(e):
             cur = _status_name(e.status)
             prev = w['last_status'] or 'unknown'
             logger.info(f"[ONWATCH] апдейт статуса: id={tid} {prev} → {cur}")
+            # повторные online-продления от Telegram не должны
+            # пересылать сообщение заново — только переход в online
             if cur == 'online':
-                await _onwatch_fire(w, 'update')
+                if prev != 'online':
+                    await _onwatch_fire(w, 'update')
             elif cur != 'unknown' and cur != prev:
                 db.update_online_watch_status(w['id'], cur)
             return

@@ -119,7 +119,11 @@ def _update_ytdlp():
     except Exception as ex:
         logger.warning(f"yt-dlp auto-update failed: {ex}")
 
-_update_ytdlp()
+# pip-обновление yt-dlp при каждом импорте блокировало старт бота на
+# десятки секунд (сеть + таймауты). Включается явно: UPDATE_YTDLP=1,
+# либо вручную командой !ytupdate
+if os.environ.get('UPDATE_YTDLP', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+    _update_ytdlp()
 
 try:
     logger.info(f"yt-dlp version: {yt_dlp.version.__version__}")
@@ -676,7 +680,7 @@ async def _scrape_tiktok_images(url):
         path = os.path.join(MEDIA_DIR, f'tiktok_{int(time.time() * 1000)}_{i}{ext}')
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as s2:
-                kwargs = {**headers, 'Referer': 'https://www.tiktok.com/'}
+                kwargs = {'headers': {**headers, 'Referer': 'https://www.tiktok.com/'}}
                 if working:
                     kwargs['proxy'] = working
                 async with s2.get(u, **kwargs) as resp:
@@ -732,7 +736,6 @@ def _resolve_url(base, uri):
 
 async def _download_m3u8_video(m3u8_url, output_path):
     import m3u8
-    from urllib.parse import urljoin
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
             async with s.get(m3u8_url) as resp:

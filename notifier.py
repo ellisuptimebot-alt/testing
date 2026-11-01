@@ -13,6 +13,7 @@ from config import (
     NOTIFY_PROTECT,
     NOTIFY_PM_DELETE,
     NOTIFY_PM_EDIT,
+    NOTIFY_PM_MEDIA,
     NOTIFY_ERRORS,
 )
 
@@ -364,7 +365,7 @@ class Notifier:
         """Пересылка медиа (фото/видео) через внешнего бота с подписью:
         сохранение по реплаю на сгорающее или при удалении отправленного медиа.
         old — строка кэша pm_msg_cache (или её аналог)."""
-        if not NOTIFY_PM_DELETE:
+        if not NOTIFY_PM_MEDIA:
             return False
         old = old or {}
         sender_id = old.get('sender_id') or 0

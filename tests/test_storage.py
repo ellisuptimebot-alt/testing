@@ -9,12 +9,13 @@ class TestStorage(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmpdir = tempfile.mkdtemp(prefix='ubtest_')
-        # Storage — синглтон: первый вызов в процессе фиксирует путь.
-        # Тесты должны выполняться в чистом процессе (unittest discover).
+        # Storage хранит инстансы по пути к БД: тест получает свою БД
+        # независимо от порядка запуска (раньше первый вызов в процессе
+        # фиксировал путь, и путь молча игнорировался).
         from storage import Storage
         cls.db = Storage(os.path.join(cls.tmpdir, 'test.db'))
         assert cls.db.db_path.endswith('test.db'), \
-            f"Синглтон уже привязан к {cls.db.db_path} — запусти тесты отдельным процессом"
+            f"Storage привязана к {cls.db.db_path} — ошибка в __new__"
 
     @classmethod
     def tearDownClass(cls):

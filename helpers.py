@@ -8,13 +8,11 @@ import re
 from telethon.errors import FloodWaitError
 
 from client import client
-from config import OWNER_ID, BOT_LANG, logger
+from config import BOT_LANG, logger
 from core import db, state
 from notifier import notify
 import ui
 
-_log = logger
-logger = logger
 
 
 def t(ru, en):

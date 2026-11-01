@@ -21,16 +21,20 @@ def _validate_table(table):
 
 
 class Storage:
-    _instance = None
+    # инстансы по пути к БД: повторный Storage('userbot.db') возвращает тот же
+    # объект, а Storage('/tmp/other.db') — отдельную БД (раньше путь после
+    # первого вызова молча игнорировался)
+    _instances = {}
     _lock = threading.Lock()
 
     def __new__(cls, db_path='userbot.db'):
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
-                    cls._instance._init(db_path)
-        return cls._instance
+        with cls._lock:
+            inst = cls._instances.get(db_path)
+            if inst is None:
+                inst = super().__new__(cls)
+                inst._init(db_path)
+                cls._instances[db_path] = inst
+            return inst
 
     def _init(self, db_path):
         self.db_path = db_path
@@ -38,6 +42,13 @@ class Storage:
         self.conn.row_factory = sqlite3.Row
         self.lock = threading.Lock()
         self._create_tables()
+
+    def close(self):
+        with self.lock:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
 
     def _create_tables(self):
         with self.lock:
@@ -197,8 +208,12 @@ class Storage:
     # ── Todos ──
 
     def add_todo(self, text):
-        tid = int(time.time())
         with self.lock:
+            # id в миллисекундах + защита от коллизии: две задачи в одну
+            # секунду раньше роняли INSERT (UNIQUE constraint) без ответа
+            tid = int(time.time() * 1000)
+            while self.conn.execute('SELECT 1 FROM todos WHERE id = ?', (tid,)).fetchone():
+                tid += 1
             self.conn.execute(
                 'INSERT INTO todos (id, text, done, created) VALUES (?, ?, 0, ?)',
                 (tid, text, tid)

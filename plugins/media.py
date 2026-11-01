@@ -1,39 +1,19 @@
 # -*- coding: utf-8 -*-
 import asyncio
-import base64
-import datetime
-import hashlib
-import json
 import os
-import random
 import re
-import string
-import time
-import uuid
 
-import aiohttp
 import yt_dlp
 from telethon import events
-from telethon.errors import FloodWaitError, MessageNotModifiedError
 
 from client import client
-from config import OWNER_ID, MEDIA_DIR, MAX_FILE_SIZE_MB, MAX_COOLDOWN_ENTRIES, logger
-from core import (
-    db, state, owner_filter, respond, command_cooldown, reply_cooldown,
-    _get_translator,
-)
-from helpers import (
-    resolve_entity, entity_label, build_status_card,
-    safe_flood, shadow_delete_msg,
-)
-from utils import fmt_time, progress_bar, safe_eval, caesar, morse_enc, gen_pwd, vigenere
-from downloaders import run_download, send_and_clean
-from notifier import notify
+from config import MEDIA_DIR, logger
+from core import db, owner_filter, respond
+from downloaders import run_download, send_and_clean, _COOKIES_PATH, _COOKIES_VALID
 import ui
 
 _log = logger
 
-from downloaders import set_max_file_size
 
 
 @client.on(events.NewMessage(pattern=r'!ytshow\s+(.+)', func=owner_filter))
@@ -126,7 +106,7 @@ async def playlist_cmd(e):
                 'cachedir': False,
                 'extract_flat': True,
                 'force_generic_extractor': False,
-                'cookiefile': os.path.abspath(os.path.join(os.path.dirname(__file__), 'cookies.txt')),
+                'cookiefile': _COOKIES_PATH if _COOKIES_VALID else None,
             }
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -291,7 +271,7 @@ async def sub_cmd(e):
                 'noplaylist': True,
                 'nocheckcertificate': True,
                 'cachedir': False,
-                'cookiefile': os.path.abspath(os.path.join(os.path.dirname(__file__), 'cookies.txt')),
+                'cookiefile': _COOKIES_PATH if _COOKIES_VALID else None,
                 'writesubtitles': True,
                 'subtitleslangs': [lang],
                 'subtitlesformat': 'srt',

@@ -1,60 +1,25 @@
 import asyncio
-import base64
-import datetime
-import hashlib
-import json
 import os
-import random
-import re
-import string
 import time
-import uuid
-from collections import defaultdict
 
-import aiohttp
-from flask import Flask
-from PIL import Image, ImageDraw
+from flask import Flask, request
 
 from telethon import events
 from telethon import utils as tgutils
-from telethon.errors import FloodWaitError, MessageNotModifiedError
+from telethon.errors import FloodWaitError
 from client import client
-from telethon.tl.functions.account import (
-    GetAuthorizationsRequest,
-)
 from telethon.tl import types
-from telethon.tl.functions.messages import SendReactionRequest
-from telethon.tl.types import (
-    ChannelParticipantsAdmins, ChannelParticipantsBots, InputMediaDice,
-    ReactionEmoji,
-    UserStatusOnline, UserStatusOffline, UserStatusRecently, UserStatusLastWeek, UserStatusLastMonth,
-)
 
-import qrcode
 
-from config import (
-    API_ID, API_HASH, PORT, OWNER_ID,
-    MEDIA_DIR, MAX_COOLDOWN_ENTRIES,
-    MAX_FILE_SIZE_MB, logger,
-)
+from config import PORT, MEDIA_DIR, MAX_COOLDOWN_ENTRIES, MAX_FILE_SIZE_MB, WEB_TOKEN, logger
 from notifier import notify
-from utils import fmt_time, progress_bar, safe_eval, caesar, morse_enc, gen_pwd, vigenere
-from downloaders import run_download, send_and_clean, set_max_file_size
-from rp_commands import (
-    RP_COMMANDS, format_rp_action, get_all_categories,
-    get_category_commands, get_rp_reply,
-)
+from utils import fmt_time
+from downloaders import set_max_file_size
+from rp_commands import RP_COMMANDS, format_rp_action, get_rp_reply
 import core
-from core import (
-    db, state, owner_filter, respond, _get_translator,
-    command_cooldown, reply_cooldown,
-)
-import ui
+from core import db, state, reply_cooldown
 
-from helpers import (
-    suppress_pm_delete, _pm_suppress_delete, resolve_entity, entity_label,
-    safe_flood, shadow_delete_msg, build_status_card,
-)
+from helpers import _pm_suppress_delete, safe_flood, shadow_delete_msg
 
 set_max_file_size(MAX_FILE_SIZE_MB)
 
@@ -139,7 +104,7 @@ async def _is_own_message(sender_id):
 # Лимит проактивного кэша медиа: меньше лимита Bot API (50 МБ),
 # чтобы файл гарантированно дошёл через внешнего бота
 MEDIA_CACHE_MAX_MB = 45
-_media_restore_recent = {}   # replied_msg_id → ts последнего восстановления (дедуп 5 мин)
+_media_restore_recent = {}   # (chat_id, replied_msg_id) → ts (дедуп 5 мин)
 
 
 async def _try_cache_media(chat_id, msg):
@@ -228,12 +193,9 @@ async def pm_delete_raw_update(e):
                 # своё сообщение (исходящее) — уведомление об удалении не отправляем,
                 # но если это было фото/видео — сохраняем копию через внешнего бота
                 if old.get('sender_id') and await _is_own_message(old['sender_id']):
+                    # своё сообщение: копию НЕ шлём — пересылка медиа только
+                    # когда удалил собеседник (см. требование ниже по флоу)
                     logger.info(f"[PM-DEL-RAW] msg={msg_id} своё сообщение — пропуск")
-                    if old.get('has_media'):
-                        await _restore_media_to_notify(
-                            old, old.get('chat_id'), msg_id,
-                            "🗑 <b>Твоё сообщение удалено</b> (медиа сохранено)"
-                        )
                     _delete_media_file(old.get('media_file'))
                     try:
                         db.delete_pm_cached(old.get('chat_id'), msg_id)
@@ -417,6 +379,13 @@ def home():
 @app.route('/stats')
 def stats_route():
     """Дашборд статистики: команды, активные треки, напоминания, размер media/."""
+    if WEB_TOKEN:
+        given = request.args.get('token') or request.headers.get('X-Token', '')
+        if given != WEB_TOKEN:
+            return {'error': 'unauthorized'}, 401
+    elif request.remote_addr not in ('127.0.0.1', '::1'):
+        # токен не задан — панель только с localhost
+        return {'error': 'unauthorized: задай WEB_TOKEN в .env'}, 401
     s = db.all_stats()
     media_bytes = 0
     try:
@@ -447,6 +416,10 @@ def run_web():
 
 @client.on(events.NewMessage(func=lambda e: e.is_private))
 async def private_handler(event):
+    # свои исходящие: AFK и автоответчик должны отвечать только на
+    # входящие, иначе бот отвечает на сообщения владельца самому себе
+    if event.out:
+        return
     sender = await event.get_sender()
     if not sender:
         return
@@ -635,8 +608,8 @@ async def pm_cache_outgoing(e):
         sender_name = f"{getattr(me, 'first_name', '') or ''} {getattr(me, 'last_name', '') or ''}".strip() or 'Ты'
         db.cache_pm_message(e.chat_id, e.id, me.id, sender_name, text, has_media, media_type)
         db.clean_pm_cache()
-        if has_media:
-            await _try_cache_media(e.chat_id, msg)
+        # свои медиа не кэшируем: переотправка идёт только для удалений
+        # собеседника, а свои сообщения он удалять не может
     except Exception as ex:
         logger.debug(f"pm_cache_outgoing err: {ex}")
 
@@ -728,28 +701,36 @@ def _media_type(msg):
     return None
 
 
-@client.on(events.NewMessage(func=lambda e: bool(e.reply_to_msg_id) and e.is_private))
+@client.on(events.NewMessage(func=lambda e: e.out and bool(e.reply_to_msg_id) and e.is_private))
 async def media_reply_restore(e):
-    """Реплай на сообщение с фото/видео (в т.ч. сгорающее) → скачать
-    и прислать файлом через внешнего бота с подписью.
+    """Реплай ВЛАДЕЛЬЦА на исчезающее (view-once/ttl) сообщение → скачать
+    копию и прислать через внешнего бота, пока её не удалили/не закрыли.
 
-    Для сгорающего (view-once) скачивание сожжёт просмотр — это и есть
-    цель фичи: забрать копию, пока её не удалили/не закрыли."""
+    Правила:
+      - срабатывает только на исходящий реплай владельца (чужие реплаи
+        на медиа не перехватываем — раньше бот слал ВСЁ, чему ответили
+        другие люди);
+      - только исчезающие сообщения (ttl на медиа или ttl_period чата);
+      - обычные неисчезающие медиа уходят через внешнего бота только
+        когда собеседник удаляет сообщение (см. pm_delete_raw_update)."""
     try:
         text = (e.raw_text or '').strip()
         if text.startswith('!'):
             return  # команды — не триггер
-        rmid = e.reply_to_msg_id
-        now = time.time()
-        if now - _media_restore_recent.get(rmid, 0) < 300:
-            return  # дедуп: не спамим на повторные ответы одному сообщению
         replied = await e.get_reply_message()
         if not replied or not getattr(replied, 'media', None):
             return
-        mtype = _media_type(replied)
-        if mtype not in ('photo', 'video', 'video_note'):
-            return  # стикеры/голосовые/гифы не тащим — только фото/видео/кружки
-        _media_restore_recent[rmid] = now
+        disappearing = (getattr(replied.media, 'ttl_seconds', None)
+                        or getattr(replied, 'ttl_period', None))
+        if not disappearing:
+            return  # обычное медиа — только при удалении собеседником
+        rmid = e.reply_to_msg_id
+        key = (e.chat_id, rmid)
+        now = time.time()
+        if now - _media_restore_recent.get(key, 0) < 300:
+            return  # дедуп: не спамим на повторные ответы одному сообщению
+        mtype = _media_type(replied) or 'document'
+        _media_restore_recent[key] = now
         for k in [k for k, v in _media_restore_recent.items() if now - v > 600]:
             _media_restore_recent.pop(k, None)
 
@@ -767,10 +748,10 @@ async def media_reply_restore(e):
                 'text': replied.raw_text or '',
                 'has_media': 1, 'media_type': mtype, 'media_file': '',
             }
-        logger.info(f"[PM-MEDIA] реплай на msg={rmid} (type={mtype}) — сохраняю через внешнего бота")
+        logger.info(f"[PM-MEDIA] реплай владельца на исчезающее msg={rmid} (type={mtype}) — сохраняю")
         ok = await _restore_media_to_notify(
             old, e.chat_id, rmid,
-            "🔥 <b>Медиа сохранено по реплаю</b>"
+            "🔥 <b>Исчезающее медиа сохранено по реплаю</b>"
         )
         if not ok:
             await notify.pm_media(

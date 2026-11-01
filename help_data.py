@@ -1,9 +1,7 @@
 from telethon import events
 from client import client
 from core import state, db, owner_filter, respond
-from config import logger
 from rp_commands import get_all_categories, get_category_commands
-from notifier import notify
 import ui
 
 CMD_DESCS = {

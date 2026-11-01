@@ -1,36 +1,20 @@
 # -*- coding: utf-8 -*-
 import asyncio
 import base64
-import datetime
 import hashlib
-import json
 import os
-import random
-import re
-import string
 import time
 import uuid
 
 import aiohttp
 from telethon import events
-from telethon.errors import FloodWaitError, MessageNotModifiedError
 
 from client import client
-from config import OWNER_ID, MEDIA_DIR, MAX_FILE_SIZE_MB, MAX_COOLDOWN_ENTRIES, logger
-from core import (
-    db, state, owner_filter, respond, command_cooldown, reply_cooldown,
-    _get_translator,
-)
-from helpers import (
-    resolve_entity, entity_label, build_status_card,
-    safe_flood, shadow_delete_msg,
-)
-from utils import fmt_time, progress_bar, safe_eval, caesar, morse_enc, gen_pwd, vigenere
-from downloaders import run_download, send_and_clean
-from notifier import notify
+from config import MEDIA_DIR, logger
+from core import db, owner_filter, respond, _get_translator
+from utils import fmt_time, safe_eval, caesar, morse_enc, gen_pwd, vigenere
 import ui
 
-_log = logger
 
 import qrcode
 from PIL import Image, ImageDraw
@@ -248,19 +232,6 @@ async def translate_cmd(e):
         await msg.edit(ui.card(f"🌐 Перевод ({target_lang})", f"{result}"))
     except Exception as ex:
         await msg.edit(ui.err(f"Ошибка перевода: {ex}", title="Переводчик"))
-    db.bump_stat('cmds')
-
-
-@client.on(events.NewMessage(pattern=r'!trhelp$', func=owner_filter))
-async def trhelp_cmd(e):
-
-    langs = ("ru, en, de, fr, es, it, pt, tr, zh, ja, ko, ar, hi, uk, pl, nl, "
-             "sv, fi, no, da, cs, el, he, th, vi, id, ms, bg, ro, hu, sr, hr, "
-             "sk, sl, et, lv, lt, ka, hy, az, kk, uz, mn")
-    await respond(e, ui.card("🌐 Языки перевода",
-                             "`!translate <код_языка> <текст>`\n" +
-                             ui.kv("Коды ISO 639-1", f"`{langs}`"),
-                             hint="Без кода — перевод на русский по умолчанию"))
     db.bump_stat('cmds')
 
 

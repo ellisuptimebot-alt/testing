@@ -47,4 +47,11 @@ NOTIFY_SESSIONS = _bool(os.environ.get('NOTIFY_SESSIONS'), True)
 NOTIFY_PROTECT = _bool(os.environ.get('NOTIFY_PROTECT'), True)
 NOTIFY_PM_DELETE = _bool(os.environ.get('NOTIFY_PM_DELETE'), True)
 NOTIFY_PM_EDIT = _bool(os.environ.get('NOTIFY_PM_EDIT'), True)
+# сохранение медиа по реплаю/удалению — отдельный флаг (раньше висел
+# на NOTIFY_PM_DELETE и ломался вместе с ним)
+NOTIFY_PM_MEDIA = _bool(os.environ.get('NOTIFY_PM_MEDIA'), True)
 NOTIFY_ERRORS = _bool(os.environ.get('NOTIFY_ERRORS'), True)
+
+# Токен веб-панели /stats: задан — доступ по ?token=... или X-Token;
+# пуст — только с localhost.
+WEB_TOKEN = os.environ.get('WEB_TOKEN', '').strip()
