@@ -72,7 +72,20 @@ class Storage:
                     last_status TEXT DEFAULT 'unknown',
                     enabled INTEGER DEFAULT 1,
                     created_at INTEGER,
-                    last_fired INTEGER DEFAULT 0
+                    last_fired INTEGER DEFAULT 0,
+                    status_since INTEGER DEFAULT 0,
+                    md INTEGER DEFAULT 0,
+                    fires INTEGER DEFAULT 0,
+                    last_source TEXT,
+                    last_error TEXT,
+                    last_activity INTEGER DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS online_watch_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_id INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    ts INTEGER NOT NULL,
+                    source TEXT
                 );
                 CREATE TABLE IF NOT EXISTS pm_msg_cache (
                     chat_id INTEGER,
@@ -109,6 +122,23 @@ class Storage:
             ocols = {row[1] for row in cur.fetchall()}
             if 'last_fired' not in ocols:
                 cur.execute('ALTER TABLE online_watch ADD COLUMN last_fired INTEGER DEFAULT 0')
+            if 'status_since' not in ocols:
+                cur.execute('ALTER TABLE online_watch ADD COLUMN status_since INTEGER DEFAULT 0')
+            if 'md' not in ocols:
+                cur.execute('ALTER TABLE online_watch ADD COLUMN md INTEGER DEFAULT 0')
+            if 'fires' not in ocols:
+                cur.execute('ALTER TABLE online_watch ADD COLUMN fires INTEGER DEFAULT 0')
+            if 'last_source' not in ocols:
+                cur.execute('ALTER TABLE online_watch ADD COLUMN last_source TEXT')
+            if 'last_error' not in ocols:
+                cur.execute('ALTER TABLE online_watch ADD COLUMN last_error TEXT')
+            if 'last_activity' not in ocols:
+                cur.execute('ALTER TABLE online_watch ADD COLUMN last_activity INTEGER DEFAULT 0')
+            cur.execute('PRAGMA table_info(online_watch_log)')
+            lcols = {row[1] for row in cur.fetchall()}
+            if 'source' not in lcols:
+                cur.execute('ALTER TABLE online_watch_log ADD COLUMN source TEXT')
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_owlog_target_ts ON online_watch_log(target_id, ts)')
             cur.execute('CREATE INDEX IF NOT EXISTS idx_pm_msg_id ON pm_msg_cache(msg_id)')
             cur.execute('CREATE INDEX IF NOT EXISTS idx_pm_chat_date ON pm_msg_cache(chat_id, date)')
             self.conn.commit()
@@ -348,13 +378,32 @@ class Storage:
 
     # ── Online watch ──
 
-    def add_online_watch(self, target_id, target_username, message, owner_id, chat_id):
+    def add_online_watch(self, target_id, target_username, message, owner_id, chat_id, md=0):
+        """Добавить трек или обновить существующий (текст/username/владелец).
+
+        Повторное добавление той же цели НЕ сбрасывает last_fired/created_at/
+        last_status/status_since: иначе повтор обошёл бы кулдаун и уведомление
+        ушло бы второй раз.
+        Возвращает True — трек добавлен, False — существующий обновлён."""
         with self.lock:
-            self.conn.execute(
-                'INSERT OR REPLACE INTO online_watch (target_id, target_username, message, owner_id, chat_id, last_status, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)',
-                (int(target_id), target_username or '', message, int(owner_id), int(chat_id), 'unknown', int(time.time()))
-            )
+            cur = self.conn.cursor()
+            exists = cur.execute(
+                'SELECT 1 FROM online_watch WHERE target_id = ?',
+                (int(target_id),)).fetchone()
+            if exists:
+                cur.execute(
+                    'UPDATE online_watch SET target_username = ?, message = ?, owner_id = ?, chat_id = ?, md = ? '
+                    'WHERE target_id = ?',
+                    (target_username or '', message, int(owner_id), int(chat_id), 1 if md else 0,
+                     int(target_id)))
+            else:
+                cur.execute(
+                    'INSERT INTO online_watch (target_id, target_username, message, owner_id, chat_id, last_status, enabled, created_at, md) '
+                    'VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)',
+                    (int(target_id), target_username or '', message, int(owner_id), int(chat_id),
+                     'unknown', int(time.time()), 1 if md else 0))
             self.conn.commit()
+            return not exists
 
     def get_online_watches(self):
         with self.lock:
@@ -362,10 +411,27 @@ class Storage:
             cur.execute('SELECT * FROM online_watch WHERE enabled = 1')
             return [dict(row) for row in cur.fetchall()]
 
-    def update_online_watch_status(self, watch_id, last_status):
+    def update_online_watch_status(self, watch_id, last_status, source='status'):
+        """Смена статуса цели: фиксирует момент (status_since — для длительностей
+        в логах) и пишет переход в online_watch_log (история для !onwatchlog).
+        Смена определяется чтением текущего значения под локом: одна строка лога
+        на реальную смену, status_since не сдвигается при повторном том же статусе.
+        Ретеншн — НЕ здесь: DELETE вынесен в prune_online_watch_log (периодически),
+        чтобы не тормозить путь записи уведомления."""
         with self.lock:
-            self.conn.execute('UPDATE online_watch SET last_status = ? WHERE id = ?', (last_status, watch_id))
+            cur = self.conn.cursor()
+            row = cur.execute(
+                'SELECT target_id, last_status FROM online_watch WHERE id = ?',
+                (int(watch_id),)).fetchone()
+            if not row or row[1] == last_status:
+                return False
+            now = int(time.time())
+            cur.execute('UPDATE online_watch SET last_status = ?, status_since = ? WHERE id = ?',
+                        (last_status, now, int(watch_id)))
+            cur.execute('INSERT INTO online_watch_log (target_id, status, ts, source) VALUES (?, ?, ?, ?)',
+                        (row[0], last_status, now, source))
             self.conn.commit()
+            return True
 
     def remove_online_watch(self, target_id=None, watch_id=None):
         with self.lock:
@@ -386,12 +452,73 @@ class Storage:
             )
             self.conn.commit()
 
+    def touch_online_watch_session(self, watch_id, ts=None):
+        """Продлить активность текущей онлайн-сессии (typing/сообщения/галочки
+        и успешная отправка уведомления). Пока now - last_activity <=
+        SESSION_TIMEOUT, сессия открыта и новые триггеры только обновляют
+        таймер — одно уведомление на сессию, а не раз в кулдаун."""
+        with self.lock:
+            self.conn.execute(
+                'UPDATE online_watch SET last_activity = ? WHERE id = ?',
+                (int(ts if ts else time.time()), int(watch_id)))
+            self.conn.commit()
+
+    def close_online_watch_session(self, watch_id):
+        """Явное закрытие сессии (уход из «недавно»): следующая активность —
+        новая сессия и новое уведомление."""
+        with self.lock:
+            self.conn.execute('UPDATE online_watch SET last_activity = 0 WHERE id = ?',
+                              (int(watch_id),))
+            self.conn.commit()
+
     def get_online_watch_by_target(self, target_id):
         with self.lock:
             cur = self.conn.cursor()
             cur.execute('SELECT * FROM online_watch WHERE target_id = ?', (int(target_id),))
             row = cur.fetchone()
             return dict(row) if row else None
+
+    def mark_online_watch_fire(self, watch_id, source, ok=True, error=''):
+        """Итог отправки уведомления: счётчик fires, последний источник триггера
+        (метрика «событие vs поллер») и текст ошибки — см. !onwatchstatus."""
+        with self.lock:
+            self.conn.execute(
+                'UPDATE online_watch SET last_source = ?, last_error = ?, fires = fires + ? WHERE id = ?',
+                (source, None if ok else (error or '')[:200],
+                 1 if ok else 0, int(watch_id)))
+            self.conn.commit()
+
+    def get_online_watch_log(self, target_id, since_ts=0):
+        """Переходы статуса цели с since_ts (для !onwatchlog), по возрастанию."""
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute('SELECT status, ts, source FROM online_watch_log '
+                        'WHERE target_id = ? AND ts >= ? ORDER BY ts',
+                        (int(target_id), int(since_ts)))
+            return [{'status': r[0], 'ts': r[1], 'source': r[2]}
+                    for r in cur.fetchall()]
+
+    def append_online_watch_log(self, target_id, status, ts, source='status'):
+        """Строка лога сессий БЕЗ смены last_status — например, «мигающая»
+        сессия по was_online: статус не изменился (offline → offline), но сама
+        сессия была и должна быть видна в !onwatchlog. source различает
+        реальный вход (status), пропущенную сессию (flicker) и канал активности
+        (typing/message/read) — для скрытого last-seen это и есть история."""
+        with self.lock:
+            self.conn.execute(
+                'INSERT INTO online_watch_log (target_id, status, ts, source) VALUES (?, ?, ?, ?)',
+                (int(target_id), status, int(ts), source))
+            self.conn.commit()
+
+    def prune_online_watch_log(self, days=90):
+        """Ретеншн истории сессий. Вызывается периодически из поллера —
+        DELETE вне критического пути записи уведомления."""
+        with self.lock:
+            cur = self.conn.execute(
+                'DELETE FROM online_watch_log WHERE ts < ?',
+                (int(time.time()) - int(days) * 86400,))
+            self.conn.commit()
+            return cur.rowcount
 
     # ── PM message cache ──
 

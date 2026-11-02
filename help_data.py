@@ -108,8 +108,10 @@ CMD_DESCS = {
     'watch':        {'desc': 'Мониторинг новых сессий (уведомление в боте)', 'syntax': '!watch [on|off]', 'example': '!watch on'},
     'check_email':  {'desc': 'Проверить email на утечки', 'syntax': '!check_email <email>', 'example': '!check_email test@example.com'},
     'protect':      {'desc': 'Детектор пропавших чатов (уведомление в боте)', 'syntax': '!protect [on|off]', 'example': '!protect on'},
-    'onwatch':      {'desc': 'Караулить появление в сети', 'syntax': '!onwatch @user <текст>', 'example': '!onwatch @username Привет, глянь ЛС'},
-    'onwatchlist':  {'desc': 'Список активных onwatch-треков', 'syntax': '!onwatchlist', 'example': '!onwatchlist'},
+    'onwatch':      {'desc': 'Караулить появление в сети (повторное добавление меняет текст)', 'syntax': '!onwatch [-m] @user <текст>', 'example': '!onwatch -m @username *привет*'},
+    'onwatchlist':  {'desc': 'Список onwatch-треков: статус цели и когда шло уведомление', 'syntax': '!onwatchlist', 'example': '!onwatchlist'},
+    'onwatchstatus': {'desc': 'Снимок трека: статус, кулдаун, счётчик отправок и ошибка', 'syntax': '!onwatchstatus @user', 'example': '!onwatchstatus @username'},
+    'onwatchlog':   {'desc': 'История сессий цели: когда заходил и сколько был', 'syntax': '!onwatchlog @user [7d|12h|30m]', 'example': '!onwatchlog @username 7d'},
     'unonwatch':    {'desc': 'Снять отслеживание', 'syntax': '!unonwatch @user', 'example': '!unonwatch @username'},
     'rphelp':       {'desc': 'Список RP-команд', 'syntax': '!rphelp', 'example': '!rphelp'},
     'trhelp':       {'desc': 'Список кодов языков для !translate', 'syntax': '!trhelp', 'example': '!trhelp'},
@@ -150,7 +152,7 @@ COMMANDS_LIST = {
         '!todo', '!todos', '!done', '!undone', '!deltodo'
     ],
     'онлайн': [
-        '!onwatch', '!onwatchlist', '!unonwatch'
+        '!onwatch', '!onwatchlist', '!onwatchstatus', '!onwatchlog', '!unonwatch'
     ],
     'безопасность': [
         '!sudo', '!watch', '!check_email', '!protect'
@@ -270,10 +272,12 @@ HELP_CATS = {
     ),
     'онлайн': (
         "⚡ **ОНЛАЙН-КАРАУЛ**\n\n"
-        "`!onwatch @user <текст>` — караулить появление в сети. Отправит сообщение таргету и уведомит в боте\n"
+        "`!onwatch [-m] @user <текст>` — караулить появление в сети (-m — markdown; в тексте markdown интерпретируется: *, _, [текст](url)). Отправит сообщение таргету и уведомит в боте\n"
         "`!onwatchlist` — список активных треков\n"
+        "`!onwatchstatus @user` — снимок трека: статус, кулдаун, счётчик отправок\n"
+        "`!onwatchlog @user [7d]` — история сессий: когда заходил и сколько был\n"
         "`!unonwatch @user` — снять отслеживание\n\n"
-        "_Срабатывает по переходу оффлайн -> онлайн, работает раз за разом_"
+        "_Срабатывает на переход в онлайн/«недавно» (offline → recently — сервер мог спрятать online), на уход из «недавно» и на пропущенные сессии (was_online); работает раз за разом_"
     ),
     'безопасность': (
         "🔐 **БЕЗОПАСНОСТЬ**\n\n"

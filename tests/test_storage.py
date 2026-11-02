@@ -102,6 +102,44 @@ class TestStorage(unittest.TestCase):
             self.db.remove_online_watch(target_id=777000111)
         self.assertIsNone(self.db.get_online_watch_by_target(777000111))
 
+    def test_online_watch_readd_updates_and_keeps_cooldown(self):
+        # повторное добавление цели обновляет текст, но НЕ сбрасывает кулдаун
+        added = self.db.add_online_watch(777000222, 'tester', 'первый', 1, -100)
+        self.assertTrue(added)
+        try:
+            row = self.db.get_online_watch_by_target(777000222)
+            self.db.touch_online_watch_fired(row['id'], 12345)
+            added2 = self.db.add_online_watch(777000222, 'tester2', 'второй', 1, -100)
+            self.assertFalse(added2)  # обновление, а не новый трек
+            row2 = self.db.get_online_watch_by_target(777000222)
+            self.assertEqual(row2['message'], 'второй')
+            self.assertEqual(row2['target_username'], 'tester2')
+            self.assertEqual(row2['last_fired'], 12345)  # кулдаун не сброшен
+        finally:
+            self.db.remove_online_watch(target_id=777000222)
+
+    def test_online_watch_status_since_on_change(self):
+        # status_since обновляется только при РЕАЛЬНОЙ смене статуса —
+        # по нему считаются длительности сессий в логах караула
+        added = self.db.add_online_watch(777000333, 'tester3', 'msg3', 1, -100)
+        self.assertTrue(added)
+        try:
+            row = self.db.get_online_watch_by_target(777000333)
+            self.db.update_online_watch_status(row['id'], 'offline')
+            r1 = self.db.get_online_watch_by_target(777000333)
+            self.assertEqual(r1['last_status'], 'offline')
+            s1 = r1['status_since']
+            self.assertTrue(s1 > 0)
+            self.db.update_online_watch_status(row['id'], 'offline')
+            r2 = self.db.get_online_watch_by_target(777000333)
+            self.assertEqual(r2['status_since'], s1)  # тот же статус — не сдвигаем
+            time.sleep(1.1)
+            self.db.update_online_watch_status(row['id'], 'online')
+            r3 = self.db.get_online_watch_by_target(777000333)
+            self.assertGreater(r3['status_since'], s1)
+        finally:
+            self.db.remove_online_watch(target_id=777000333)
+
     # ── Заметки ──
 
     def test_notes(self):
