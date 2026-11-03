@@ -766,7 +766,7 @@ async def media_reply_restore(e):
 import plugins
 plugins.load_all()
 
-from plugins.watch import online_watcher
+from plugins.watch import connection_watcher, online_watcher
 from plugins.menu import handle_bot_callback, handle_bot_message
 from plugins.toolbox import reminder_worker
 
@@ -829,6 +829,14 @@ if __name__ == "__main__":
         logger.info("[TASK] online_watcher запущен")
     except Exception as e:
         logger.warning(f"[TASK] online_watcher не запущен: {e}")
+
+    # Сторож соединения: внеплановый опрос караула через 2с после реконнекта,
+    # не дожидаясь шага поллера (до 35с)
+    try:
+        spawn_task('connection_watcher', connection_watcher())
+        logger.info("[TASK] connection_watcher запущен")
+    except Exception as e:
+        logger.warning(f"[TASK] connection_watcher не запущен: {e}")
 
     # Напоминания: воркер БД + восстановление отложенных после рестарта
     try:

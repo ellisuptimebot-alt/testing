@@ -18,6 +18,31 @@ from config import (
 )
 
 
+# Тон уведомления зависит от канала: звонок важнее профиля, поэтому источник
+# виден и эмодзи, и текстом, а не общим «появился в сети». Функция вынесена
+# на уровень модуля, чтобы её можно было тестировать без импорта config/env.
+_WATCH_SOURCE_LABELS = {
+    'typing': ('💬', 'печатает вам'),
+    'message': ('✉️', 'написал вам'),
+    'read': ('👁', 'прочитал ваше сообщение'),
+    'update-profile': ('📝', 'обновил профиль'),
+    'update-story': ('📸', 'выложил сторис'),
+    'update-reaction': ('👍', 'отреагировал на ваше сообщение'),
+    'update-call': ('📞', 'звонил вам'),
+    'update-edit': ('✏️', 'правит сообщение в ЛС'),
+}
+
+
+def watch_source_badge(source=None):
+    """(эмодзи, подпись) для источника триггера. Суффиксы поллера
+    (-flicker/-recently) дают нейтральное «появился в сети»."""
+    s = (source or '').lower()
+    for suf in ('-flicker', '-recently'):
+        if s.endswith(suf):
+            s = s[: -len(suf)]
+    return _WATCH_SOURCE_LABELS.get(s, ('⚡', 'появился в сети'))
+
+
 class Notifier:
     def __init__(self):
         # Telegram Business: id соединения «бот подключён к аккаунту».
@@ -176,7 +201,7 @@ class Notifier:
         for attempt in range(3):
             data = await self._api('sendMessage', payload)
             if data and data.get('ok'):
-                logger.info(f"[NOTIFY] Успешно отправлено")
+                logger.info("[NOTIFY] Успешно отправлено")
                 return True
             desc = str((data or {}).get('description') or '')
             if 'Bad Request' in desc:
@@ -300,14 +325,16 @@ class Notifier:
                 continue
             await self._process_updates(data.get('result'), handler, message_handler)
 
-    async def online_watch(self, username: str, target_id: int, sent_msg: str, name: str = None):
+    async def online_watch(self, username: str, target_id: int, sent_msg: str,
+                           name: str = None, source: str = None):
         if not NOTIFY_ONLINE_WATCH:
             return
         user_str = self._format_user(target_id, username=username, name=name)
+        emoji, label = watch_source_badge(source)
         msg = (
-            f"⚡ <b>ONLINE WATCH</b>\n\n"
+            f"{emoji} <b>ONLINE WATCH</b>\n\n"
             f"👤 Пользователь: {user_str}\n"
-            f"🟢 Статус: <b>появился в сети</b>\n\n"
+            f"🟢 Статус: <b>{label}</b>\n\n"
             f"✉️ <b>Сообщение отправлено таргету:</b>\n"
             f"<blockquote>{_escape(self._cap(sent_msg or '', 3000))}</blockquote>"
         )
